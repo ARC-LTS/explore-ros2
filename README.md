@@ -1,93 +1,153 @@
-# explore-ros2
+# m-explore ROS2 port
+
+ROS2 package port for multi-robot autonomous exploration of [m-explore](https://github.com/hrnr/m-explore). Currently tested on Eloquent, Dashing, Foxy, and Galactic distros.
+
+### Contents
+1. [Autonomous exploration](#Autonomous-exploration)
+    * [Demo in simulation with a TB3 robot](#Simulation-with-a-TB3-robot)    
+    * [Demo with a JetBot](#On-a-JetBot-with-realsense-cameras)
+    * [Instructions for the simulation demo](#Running-the-explore-demo-with-TB3)    
+2. [Multirobot map merge](#Multirobot-map-merge)
+    * [Simulation demo with known initial poses](#Known-initial-poses)
+    * [Simulation demo with unknown initial poses](#Unknown-initial-poses)
+    * [ROS2 requirements](#ROS2-requirements)
+    * [Instructions for simulation demos](#Running-the-demo-with-TB3)
+
+## Autonomous exploration
+
+### Simulation with a TB3 robot
+https://user-images.githubusercontent.com/8033598/128805356-be90a880-16c6-4fc9-8f54-e3302873dc8c.mp4
 
 
+### On a JetBot with realsense cameras
+https://user-images.githubusercontent.com/18732666/128493567-6841dde0-2250-4d81-9bcb-8b216e0fb34d.mp4
 
-## Getting started
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Installing
+----------
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+No binaries yet.
 
-## Add your files
+Building
+--------
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Build as a standard colcon package. There are no special dependencies needed
+(use rosdep to resolve dependencies in ROS). 
+
+RUNNING
+-------
+To run with a params file just run it with
+```
+ros2 run explore_lite explore --ros-args --params-file <path_to_ros_ws>/m-explore-ros2/explore/config/params.yaml
+```
+
+### Running the explore demo with TB3
+Install nav2 and tb3 simulation. You can follow the [tutorial](https://navigation.ros.org/getting_started/index.html#installation).
+
+Then just run the nav2 stack with slam:
 
 ```
-cd existing_repo
-git remote add origin https://git.turingnet.work/lts/explore-ros2.git
-git branch -M main
-git push -uf origin main
+export TURTLEBOT3_MODEL=waffle
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
+ros2 launch nav2_bringup tb3_simulation_launch.py slam:=True
 ```
 
-## Integrate with your tools
+And run this package with
+```
+ros2 launch explore_lite explore.launch.py
+```
 
-- [ ] [Set up project integrations](https://git.turingnet.work/lts/explore-ros2/-/settings/integrations)
+You can open rviz2 and add the exploration frontiers marker (topic is `explore/frontiers`) to see the algorithm working and the frontier chosen to explore.
 
-## Collaborate with your team
+### Additional features
+#### Stop/Resume exploration
+By default the exploration node will start right away the frontier-based exploration algorithm. Alternatively, you can stop the exploration by publishing to a `False` to `explore/resume` topic. This will stop the exploration and the robot will stop moving. You can resume the exploration by publishing to `True` to `explore/resume`.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+#### Returning to initial pose
+The robot will return to its initial pose after exploration if you want by defining the parameter `return_to_init` to `True` when launching the node.
 
-## Test and Deploy
+#### TB3 troubleshooting (with foxy)
+If you have trouble with TB3 in simulation, as we did, add these extra steps for configuring it.
 
-Use the built-in continuous integration in GitLab.
+```
+source /opt/ros/${ROS_DISTRO}/setup.bash
+export TURTLEBOT3_MODEL=waffle
+sudo rm -rf /opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations
+sudo git clone https://github.com/ROBOTIS-GIT/turtlebot3_simulations /opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations/turtlebot3_gazebo/models
+```
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+Then you'll be able to run it.
 
-***
+______________________________________________________________________
+## Multirobot map merge
 
-# Editing this README
+This package works with known and unknown initial poses of the robots. It merges the maps of the robots and publishes the merged map. Some results in simulation are shown below.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### Known initial poses
 
-## Suggestions for a good README
+This modality gives normally the best results. The original ROS1 code only supports [slam_gmapping](https://github.com/ros-perception/slam_gmapping) type of maps for the merge. The following shows the result with that.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+https://user-images.githubusercontent.com/8033598/144522712-c31fb4bb-bb5a-4859-b3e1-8ad665f80696.mp4
 
-## Name
-Choose a self-explaining name for your project.
+We also support using [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) in a yet [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat). The following demo shows the map merging using the currently supported and most used ROS2-SLAM library.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+https://user-images.githubusercontent.com/8033598/170846935-cfae9f3f-5edd-43ea-b993-7b3ba1db921b.mp4
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+### Unknown initial poses 
+It works better if the robots start very close (< 3 meters) to each other so their relative positions can be calculated properly.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+https://user-images.githubusercontent.com/8033598/144522696-517d54fd-74d0-4c55-9aca-f1b9679afb3e.mp4
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### ROS2 requirements
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+#### SLAM
+Because of the logic that merges the maps, currently as a straightforward port to ROS2 from the ROS1 version, the SLAM needs to be done using the ROS1 defacto slam option which is [slam_gmapping](https://github.com/ros-perception/slam_gmapping), which hasn't been ported officially to ROS2 yet. There is an unofficial port but it lacks to pass a namespace to its launch file. For that, this repo was tested with one of the authors of this package's [fork](https://github.com/charlielito/slam_gmapping/tree/feature/namespace_launch). You'll need to git clone to your workspace and build it with colcon.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```
+cd <your/ros2_ws/src>
+git clone https://github.com/charlielito/slam_gmapping.git --branch feature/namespace_launch
+cd ..
+colcon build --symlink-install --packages-up-to slam_gmapping
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+**Note**: You could use [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) instead but you need to use this [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat) which is still under development.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+#### Nav2 gazebo spawner (deprecated in humble)
+To spawn multiple robots, you need the `nav2_gazebo_spawner` which does not come up with the `nav2-bringup` installation. For that, install it with `sudo apt install ros-${ROS_DISTRO}-nav2-gazebo-spawner`.
+Note that was the case for release previous to `humble` but since `humble` release, this package is deprecated and a gazebo node is used for this. So, if you are using `humble` or newer, you don't need to install it.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+#### Nav2 config files
+This repo has some config examples and launch files for running this package with 2 TB3 robots and a world with nav2. Nonetheless, they are only compatible with the galactic/humble distros and since some breaking changes were introduced in this distro, if you want to try it with another ros2 distro you'll need to tweak those param files for that nav2's distro version (which shouldn't be hard).
 
-## License
-For open source projects, say how it is licensed.
+### Running the demo with TB3
+First, you'll need to launch the whole simulation stack, nav2 stacks and slam stacks per robot. For that just launch::
+```
+export TURTLEBOT3_MODEL=waffle
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
+ros2 launch multirobot_map_merge multi_tb3_simulation_launch.py slam_gmapping:=True
+```
+Now run the merging node:
+```
+ros2 launch multirobot_map_merge map_merge.launch.py
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+By default, the demo runs with known initial poses. You can change that by launching again both launch commands with the flag `known_init_poses:=False`
+
+Then you can start moving each robot with its corresponding rviz2 interface by sending nav2 goals. To see the map merged just launch rviz2:
+```
+rviz2 -d <your/ros2_ws>/src/m-explore-ros2/map_merge/launch/map_merge.rviz
+```
+
+**Note**: If you want to use slam_toolbox, launch `multirobot_map_merge` with the following flag instead: `slam_toolbox:=True`. Remember to use the experimental branch mentioned above.
+
+WIKI
+----
+No wiki yet.
+
+COPYRIGHT
+---------
+
+Packages are licensed under BSD license. See respective files for details.
