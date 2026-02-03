@@ -2,6 +2,7 @@
 #define FRONTIER_SEARCH_H_
 
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
+#include "sensor_msgs/msg/battery_state.hpp"
 
 namespace frontier_exploration
 {
@@ -40,7 +41,12 @@ public:
    * @param position Initial position to search from
    * @return List of frontiers, if any
    */
-  std::vector<Frontier> searchFrom(geometry_msgs::msg::Point position);
+  std::vector<Frontier> searchFrom(geometry_msgs::msg::Point position,
+                                   const sensor_msgs::msg::BatteryState& battery_state,
+                                   const geometry_msgs::msg::Point& home_pos,
+                                   double energy_per_meter,
+                                   double battery_safety_margin,
+                                   double battery_penalty_scale);
 
 protected:
   /**
@@ -73,7 +79,13 @@ protected:
    * @param frontier frontier for which compute the cost
    * @return cost of the frontier
    */
-  double frontierCost(const Frontier& frontier);
+  double frontierCost(const Frontier& frontier,
+                      const sensor_msgs::msg::BatteryState& battery_state,
+                      const geometry_msgs::msg::Point& robot_pos,
+                      const geometry_msgs::msg::Point& home_pos,
+                      double energy_per_meter,
+                      double battery_safety_margin,
+                      double battery_penalty_scale);
 
 private:
   nav2_costmap_2d::Costmap2D* costmap_;

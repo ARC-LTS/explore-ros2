@@ -54,6 +54,7 @@
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <sensor_msgs/msg/battery_state.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -123,6 +124,9 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
   void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
+  rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
+  void batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg);
+
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
   geometry_msgs::msg::Point prev_goal_;
   double prev_distance_;
@@ -130,6 +134,7 @@ private:
   size_t last_markers_count_;
 
   geometry_msgs::msg::Pose initial_pose_;
+  sensor_msgs::msg::BatteryState latest_battery_state_;
   void returnToInitialPose(void);
 
   // parameters
@@ -140,6 +145,12 @@ private:
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;
+
+  // battery-aware parameters
+  std::string battery_topic_;
+  double energy_per_meter_;
+  double battery_safety_margin_;
+  double battery_penalty_scale_;
 };
 }  // namespace explore
 

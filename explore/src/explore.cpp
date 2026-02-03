@@ -70,6 +70,11 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<std::string>("battery_topic", "/battery_state");
+  this->declare_parameter<double>("energy_per_meter", 0.1);
+  this->declare_parameter<double>("battery_safety_margin", 0.1);
+  this->declare_parameter<double>("battery_penalty_scale", 0.0);
+
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -80,6 +85,10 @@ Explore::Explore()
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("battery_topic", battery_topic_);
+  this->get_parameter("energy_per_meter", energy_per_meter_);
+  this->get_parameter("battery_safety_margin", battery_safety_margin_);
+  this->get_parameter("battery_penalty_scale", battery_penalty_scale_);
 
   progress_timeout_ = timeout;
   move_base_client_ =
@@ -102,6 +111,10 @@ Explore::Explore()
   resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
+  
+  battery_sub_ = this->create_subscription<sensor_msgs::msg::BatteryState>(
+      battery_topic_, 10,
+      std::bind(&Explore::batteryCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
@@ -143,6 +156,11 @@ void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
   } else {
     stop();
   }
+}
+
+void Explore::batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg)
+{
+    latest_battery_state_ = *msg;
 }
 
 void Explore::visualizeFrontiers(
@@ -242,7 +260,7 @@ void Explore::makePlan()
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
-  auto frontiers = search_.searchFrom(pose.position);
+  auto frontiers = search_.searchFrom(pose.position, latest_battery_state_, initial_pose_.position, energy_per_meter_, battery_safety_margin_, battery_penalty_scale_);
   RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
     RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);

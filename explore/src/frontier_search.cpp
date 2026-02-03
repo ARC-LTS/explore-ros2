@@ -24,7 +24,12 @@ FrontierSearch::FrontierSearch(nav2_costmap_2d::Costmap2D* costmap,
 }
 
 std::vector<Frontier>
-FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
+FrontierSearch::searchFrom(geometry_msgs::msg::Point position,
+                           const sensor_msgs::msg::BatteryState& battery_state,
+                           const geometry_msgs::msg::Point& home_pos,
+                           double energy_per_meter,
+                           double battery_safety_margin,
+                           double battery_penalty_scale)
 {
   std::vector<Frontier> frontier_list;
 
@@ -86,7 +91,7 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position)
 
   // set costs of frontiers
   for (auto& frontier : frontier_list) {
-    frontier.cost = frontierCost(frontier);
+    frontier.cost = frontierCost(frontier, battery_state, position, home_pos, energy_per_meter, battery_safety_margin, battery_penalty_scale);
   }
   std::sort(
       frontier_list.begin(), frontier_list.end(),
@@ -189,10 +194,34 @@ bool FrontierSearch::isNewFrontierCell(unsigned int idx,
   return false;
 }
 
-double FrontierSearch::frontierCost(const Frontier& frontier)
+double FrontierSearch::frontierCost(const Frontier& frontier,
+                                    const sensor_msgs::msg::BatteryState& battery_state,
+                                    const geometry_msgs::msg::Point& robot_pos,
+                                    const geometry_msgs::msg::Point& home_pos,
+                                    double energy_per_meter,
+                                    double battery_safety_margin,
+                                    double battery_penalty_scale)
 {
-  return (potential_scale_ * frontier.min_distance *
+  // Feasibility Check
+  double dist_to_frontier = frontier.min_distance;
+  double dist_to_home = std::sqrt(std::pow(frontier.centroid.x - home_pos.x, 2) + std::pow(frontier.centroid.y - home_pos.y, 2));
+  double total_dist = dist_to_frontier + dist_to_home;
+  double energy_cost = total_dist * energy_per_meter;
+
+  if (energy_cost > battery_state.percentage - battery_safety_margin)
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  // Original Cost
+  double original_cost = (potential_scale_ * frontier.min_distance *
           costmap_->getResolution()) -
          (gain_scale_ * frontier.size * costmap_->getResolution());
+  
+  // Battery Penalty
+  double battery_penalty = battery_penalty_scale * energy_cost;
+
+  return original_cost + battery_penalty;
 }
 }  // namespace frontier_exploration
+
