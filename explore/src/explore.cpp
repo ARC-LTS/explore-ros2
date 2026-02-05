@@ -59,6 +59,8 @@ Explore::Explore()
   , costmap_client_(*this, &tf_buffer_)
   , prev_distance_(0)
   , last_markers_count_(0)
+  , goal_active_(false)
+  , goal_sent_time_(this->now())
 {
   double timeout;
   double min_frontier_size;
@@ -142,11 +144,56 @@ Explore::Explore()
       [this]() { makePlan(); });
   // Start exploration right away
   makePlan();
+
+  // Create services
+  start_exploration_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "~/start",
+      std::bind(&Explore::startExplorationServiceCallback, this, std::placeholders::_1, std::placeholders::_2));
+  stop_exploration_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "~/stop",
+      std::bind(&Explore::stopExplorationServiceCallback, this, std::placeholders::_1, std::placeholders::_2));
+  return_to_initial_pose_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "~/return_to_initial_pose",
+      std::bind(&Explore::returnToInitialPoseServiceCallback, this, std::placeholders::_1, std::placeholders::_2));
 }
 
 Explore::~Explore()
 {
   stop();
+}
+
+bool Explore::startExplorationServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    (void)request;
+    resume();
+    response->success = true;
+    response->message = "Exploration resumed.";
+    return true;
+}
+
+bool Explore::stopExplorationServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    (void)request;
+    stop(false); // Stop, but don't consider exploration finished
+    response->success = true;
+    response->message = "Exploration stopped.";
+    return true;
+}
+
+bool Explore::returnToInitialPoseServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    (void)request;
+    stop(false); // Stop current exploration first
+    returnToInitialPose();
+    response->success = true;
+    response->message = "Returning to initial pose.";
+    return true;
 }
 
 void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
@@ -212,8 +259,12 @@ void Explore::visualizeFrontiers(
   // weighted frontiers are always sorted
   double min_cost = frontiers.empty() ? 0. : frontiers.front().cost;
 
+  m.action = visualization_msgs::msg::Marker::DELETE;
+  m.id = 0; // ID 0 is conventionally used for DELETEALL if no other ID is specified.
+  markers.push_back(m);
+
   m.action = visualization_msgs::msg::Marker::ADD;
-  size_t id = 0;
+  size_t id = 1; // Start ID from 1 to avoid conflict with DELETEALL (ID 0)
   for (auto& frontier : frontiers) {
     m.type = visualization_msgs::msg::Marker::POINTS;
     m.id = int(id);
@@ -244,12 +295,15 @@ void Explore::visualizeFrontiers(
   }
   size_t current_markers_count = markers.size();
 
-  // delete previous markers, which are now unused
-  m.action = visualization_msgs::msg::Marker::DELETE;
-  for (; id < last_markers_count_; ++id) {
-    m.id = int(id);
-    markers.push_back(m);
-  }
+  // The DELETEALL covers old markers, so individual DELETE is no longer strictly needed but kept for completeness
+  // In this case, DELETEALL clears everything.
+  // The id loop for deleting specific old markers is not required if DELETEALL is used.
+  // Original delete loop:
+  // m.action = visualization_msgs::msg::Marker::DELETE;
+  // for (; id < last_markers_count_; ++id) {
+  //   m.id = int(id);
+  //   markers.push_back(m);
+  // }
 
   last_markers_count_ = current_markers_count;
   marker_array_publisher_->publish(markers_msg);
@@ -257,6 +311,21 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  // If a goal is currently being pursued, do not send a new one.
+  // The goal_active_ flag is set to true when a goal is accepted and false when its result is received.
+  if (goal_active_) {
+    // Check if the active goal has timed out waiting for a result
+    if ((this->now() - goal_sent_time_) > tf2::durationFromSec(progress_timeout_)) {
+      RCLCPP_WARN(logger_, "Active navigation goal has timed out waiting for result (%f seconds). Assuming stuck and moving on. Consider increasing 'progress_timeout' if this occurs frequently.", progress_timeout_);
+      goal_active_ = false; // Reset to allow new goal selection
+      // It might be beneficial to cancel the goal here, but async_cancel_all_goals() could be too aggressive.
+      // For now, simply assuming it's stuck and allowing a new goal to be sent.
+    } else {
+      RCLCPP_DEBUG(logger_, "A navigation goal is currently active. Deferring new plan generation.");
+      return; // Return if active and not timed out
+    }
+  }
+  
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
@@ -266,9 +335,9 @@ void Explore::makePlan()
     RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
+  // --- Exploration Completion Check 1: No frontiers found at all ---
   if (frontiers.empty()) {
-    RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    stop(true);
+    handleExplorationCompletion();
     return;
   }
 
@@ -277,15 +346,16 @@ void Explore::makePlan()
     visualizeFrontiers(frontiers);
   }
 
-  // find non blacklisted frontier
+  // --- Find non-blacklisted frontier ---
   auto frontier =
       std::find_if_not(frontiers.begin(), frontiers.end(),
                        [this](const frontier_exploration::Frontier& f) {
                          return goalOnBlacklist(f.centroid);
                        });
+
+  // --- Exploration Completion Check 2: All found frontiers are blacklisted ---
   if (frontier == frontiers.end()) {
-    RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    stop(true);
+    handleExplorationCompletion();
     return;
   }
   geometry_msgs::msg::Point target_position = frontier->centroid;
@@ -304,7 +374,7 @@ void Explore::makePlan()
       tf2::durationFromSec(progress_timeout_)) && !resuming_) {
     frontier_blacklist_.push_back(target_position);
     RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-    makePlan();
+    makePlan(); // Immediately try to find new plan after blacklisting
     return;
   }
 
@@ -313,32 +383,45 @@ void Explore::makePlan()
     resuming_ = false;
   }
 
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal) {
-    return;
-  }
-
   RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
 
   // send goal to move_base if we have something new to pursue
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = target_position;
-  goal.pose.pose.orientation.w = 1.;
+  // Calculate orientation to face the frontier centroid from the robot's current position
+  double yaw = atan2(target_position.y - pose.position.y, target_position.x - pose.position.x);
+  tf2::Quaternion q;
+  q.setRPY(0, 0, yaw);
+  goal.pose.pose.orientation = tf2::toMsg(q);
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
+  send_goal_options.goal_response_callback =
+      std::bind(&Explore::goalResponseCallback, this, _1);
   send_goal_options.result_callback =
-      [this,
-       target_position](const NavigationGoalHandle::WrappedResult& result) {
-        reachedGoal(result, target_position);
-      };
+      std::bind(&Explore::resultCallback, this, _1, target_position);
   move_base_client_->async_send_goal(goal, send_goal_options);
+}
+
+void Explore::handleExplorationCompletion()
+{
+  RCLCPP_WARN(logger_, "Exploration finished: no more frontiers found or all traversed/tried out.");
+  
+  // 1. Halt exploration (cancel current goal, stop timer)
+  RCLCPP_INFO(logger_, "Halting exploration due to completion.");
+  move_base_client_->async_cancel_all_goals(); // Cancel any active navigation goal
+  exploring_timer_->cancel(); // Stop the main planning loop
+  goal_active_ = false; // Ensure goal active state is reset
+
+  // 2. Return to original pose, if configured
+  if (return_to_init_) {
+    RCLCPP_INFO(logger_, "Initiating return to initial pose as exploration finished.");
+    returnToInitialPose(); // This function already handles sending the goal
+  } else {
+    RCLCPP_INFO(logger_, "Robot will remain at current position as return_to_init is false.");
+  }
 }
 
 void Explore::returnToInitialPose()
@@ -352,6 +435,14 @@ void Explore::returnToInitialPose()
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  send_goal_options.result_callback =
+      [this](const NavigationGoalHandle::WrappedResult& result) {
+        if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+          RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
+        } else {
+          RCLCPP_WARN(logger_, "Failed to return to initial pose: %d", static_cast<int>(result.code));
+        }
+      };
   move_base_client_->async_send_goal(goal, send_goal_options);
 }
 
@@ -372,7 +463,19 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
   return false;
 }
 
-void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
+void Explore::goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_handle)
+{
+  if (!goal_handle) {
+    RCLCPP_ERROR(logger_, "Goal was rejected by action server.");
+    goal_active_ = false; // Goal rejected, so no active goal
+  } else {
+    RCLCPP_INFO(logger_, "Goal accepted by action server, waiting for result.");
+    goal_active_ = true; // Goal accepted, now active
+    goal_sent_time_ = this->now(); // Record the time the goal was accepted
+  }
+}
+
+void Explore::resultCallback(const NavigationGoalHandle::WrappedResult& result,
                           const geometry_msgs::msg::Point& frontier_goal)
 {
   switch (result.code) {

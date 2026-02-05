@@ -108,7 +108,7 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
   Frontier output;
   output.centroid.x = 0;
   output.centroid.y = 0;
-  output.size = 1;
+  output.size = 0; // Initialize size to 0, it will be incremented for valid points.
   output.min_distance = std::numeric_limits<double>::infinity();
 
   // record initial contact point for frontier
@@ -141,6 +141,12 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
         costmap_->indexToCells(nbr, mx, my);
         costmap_->mapToWorld(mx, my, wx, wy);
 
+        // Check for NaN or Inf values in world coordinates
+        if (std::isnan(wx) || std::isinf(wx) || std::isnan(wy) || std::isinf(wy)) {
+            RCLCPP_ERROR(logger_, "[FrontierSearch] Invalid world coordinates (NaN/Inf) detected for cell (%d, %d). Skipping this point.", mx, my);
+            continue; // Skip this point, do not add it to the frontier
+        }
+        
         geometry_msgs::msg::Point point;
         point.x = wx;
         point.y = wy;
@@ -170,8 +176,15 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
   }
 
   // average out frontier centroid
-  output.centroid.x /= output.size;
-  output.centroid.y /= output.size;
+  if (output.size > 0) { // Avoid division by zero
+      output.centroid.x /= output.size;
+      output.centroid.y /= output.size;
+  } else {
+      RCLCPP_WARN(logger_, "[FrontierSearch] Frontier with size 0 created. Centroid will be (0,0).");
+      // If a frontier is size 0, it shouldn't be added to the list in searchFrom anyway
+      // But for safety, ensure min_distance is infinity if size is 0
+      output.min_distance = std::numeric_limits<double>::infinity();
+  }
   return output;
 }
 

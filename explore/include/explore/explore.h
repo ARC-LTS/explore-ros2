@@ -51,6 +51,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
+#include <std_srvs/srv/trigger.hpp> // Add this line
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -105,8 +106,9 @@ private:
   // void
   // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
   // future);
-  void reachedGoal(const NavigationGoalHandle::WrappedResult& result,
-                   const geometry_msgs::msg::Point& frontier_goal);
+  void goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_handle);
+  void resultCallback(const NavigationGoalHandle::WrappedResult& result,
+                      const geometry_msgs::msg::Point& frontier_goal);
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
@@ -137,6 +139,20 @@ private:
   sensor_msgs::msg::BatteryState latest_battery_state_;
   void returnToInitialPose(void);
 
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_exploration_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_exploration_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr return_to_initial_pose_service_;
+
+  bool startExplorationServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  bool stopExplorationServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  bool returnToInitialPoseServiceCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+
   // parameters
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
@@ -145,12 +161,16 @@ private:
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;
+  bool goal_active_ = false;
+  rclcpp::Time goal_sent_time_;
 
   // battery-aware parameters
   std::string battery_topic_;
   double energy_per_meter_;
   double battery_safety_margin_;
   double battery_penalty_scale_;
+
+  void handleExplorationCompletion();
 };
 }  // namespace explore
 
