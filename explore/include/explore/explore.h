@@ -107,6 +107,9 @@ private:
   // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
   // future);
   void goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_handle);
+  void feedbackCallback(
+      NavigationGoalHandle::SharedPtr,
+      const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback);
   void resultCallback(const NavigationGoalHandle::WrappedResult& result,
                       const geometry_msgs::msg::Point& frontier_goal);
 
@@ -162,6 +165,8 @@ private:
   std::string robot_base_frame_;
   bool resuming_ = false;
   bool goal_active_ = false;
+  bool waiting_for_goal_response_ = false;
+  bool exploration_finished_ = false;
   rclcpp::Time goal_sent_time_;
 
   // battery-aware parameters
