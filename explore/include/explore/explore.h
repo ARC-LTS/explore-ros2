@@ -75,108 +75,111 @@ namespace explore
  * @brief A class adhering to the robot_actions::Action interface that moves the
  * robot base to explore its environment.
  */
-class Explore : public rclcpp::Node
-{
+  class Explore: public rclcpp::Node
+  {
 public:
-  Explore();
-  ~Explore();
+    Explore();
+    ~Explore();
 
-  void start();
-  void stop(bool finished_exploring = false);
-  void resume();
+    void start();
+    void stop(bool finished_exploring = false);
+    void resume();
 
-  using NavigationGoalHandle =
-      rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>;
+    using NavigationGoalHandle =
+      rclcpp_action::ClientGoalHandle < nav2_msgs::action::NavigateToPose >;
 
 private:
-  /**
-   * @brief  Make a global plan
-   */
-  void makePlan();
+    /**
+     * @brief  Make a global plan
+     */
+    void makePlan();
 
-  // /**
-  //  * @brief  Publish a frontiers as markers
-  //  */
-  void visualizeFrontiers(
-      const std::vector<frontier_exploration::Frontier>& frontiers);
+    // /**
+    //  * @brief  Publish a frontiers as markers
+    //  */
+    void visualizeFrontiers(
+      const std::vector < frontier_exploration::Frontier > & frontiers);
 
-  bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
+    bool goalOnBlacklist(const geometry_msgs::msg::Point & goal);
 
-  NavigationGoalHandle::SharedPtr navigation_goal_handle_;
-  // void
-  // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
-  // future);
-  void goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_handle);
-  void feedbackCallback(
+    NavigationGoalHandle::SharedPtr navigation_goal_handle_;
+    // void
+    // goal_response_callback(std::shared_future<NavigationGoalHandle::SharedPtr>
+    // future);
+    void goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_handle);
+    void feedbackCallback(
       NavigationGoalHandle::SharedPtr,
-      const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback);
-  void resultCallback(const NavigationGoalHandle::WrappedResult& result,
-                      const geometry_msgs::msg::Point& frontier_goal);
+      const std::shared_ptr < const nav2_msgs::action::NavigateToPose::Feedback > feedback);
+    void resultCallback(
+      const NavigationGoalHandle::WrappedResult & result,
+      const geometry_msgs::msg::Point & frontier_goal);
 
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      marker_array_publisher_;
-  rclcpp::Logger logger_;
-  tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
+    rclcpp::Publisher < visualization_msgs::msg::MarkerArray > ::SharedPtr
+    marker_array_publisher_;
+    rclcpp::Logger logger_;
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
 
-  Costmap2DClient costmap_client_;
-  rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
-      move_base_client_;
-  frontier_exploration::FrontierSearch search_;
-  rclcpp::TimerBase::SharedPtr exploring_timer_;
-  // rclcpp::TimerBase::SharedPtr oneshot_;
+    Costmap2DClient costmap_client_;
+    rclcpp_action::Client < nav2_msgs::action::NavigateToPose > ::SharedPtr
+    move_base_client_;
+    frontier_exploration::FrontierSearch search_;
+    rclcpp::TimerBase::SharedPtr exploring_timer_;
+    // rclcpp::TimerBase::SharedPtr oneshot_;
 
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
-  void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
+    rclcpp::Subscription < std_msgs::msg::Bool > ::SharedPtr resume_subscription_;
+    void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
-  rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
-  void batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg);
+    rclcpp::Subscription < sensor_msgs::msg::BatteryState > ::SharedPtr battery_sub_;
+    void batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg);
 
-  std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
-  geometry_msgs::msg::Point prev_goal_;
-  double prev_distance_;
-  rclcpp::Time last_progress_;
-  size_t last_markers_count_;
+    std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
+    geometry_msgs::msg::Point prev_goal_;
+    double prev_distance_;
+    rclcpp::Time last_progress_;
+    size_t last_markers_count_;
 
-  geometry_msgs::msg::Pose initial_pose_;
-  sensor_msgs::msg::BatteryState latest_battery_state_;
-  void returnToInitialPose(void);
+    geometry_msgs::msg::Pose initial_pose_;
+    sensor_msgs::msg::BatteryState latest_battery_state_;
+    void returnToInitialPose(void);
 
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_exploration_service_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_exploration_service_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr return_to_initial_pose_service_;
+    rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
+    rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr stop_exploration_service_;
+    rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr return_to_initial_pose_service_;
 
-  bool startExplorationServiceCallback(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
-  bool stopExplorationServiceCallback(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
-  bool returnToInitialPoseServiceCallback(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    bool startExplorationServiceCallback(
+      const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
+      std::shared_ptr < std_srvs::srv::Trigger::Response > response);
+    bool stopExplorationServiceCallback(
+      const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
+      std::shared_ptr < std_srvs::srv::Trigger::Response > response);
+    bool returnToInitialPoseServiceCallback(
+      const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
+      std::shared_ptr < std_srvs::srv::Trigger::Response > response);
 
-  // parameters
-  double planner_frequency_;
-  double potential_scale_, orientation_scale_, gain_scale_;
-  double progress_timeout_;
-  bool visualize_;
-  bool return_to_init_;
-  std::string robot_base_frame_;
-  bool resuming_ = false;
-  bool goal_active_ = false;
-  bool waiting_for_goal_response_ = false;
-  bool exploration_finished_ = false;
-  rclcpp::Time goal_sent_time_;
+    // parameters
+    double planner_frequency_;
+    double potential_scale_, orientation_scale_, gain_scale_;
+    double progress_timeout_;
+    bool visualize_;
+    bool return_to_init_;
+    int no_frontier_retry_;
+    std::string robot_base_frame_;
+    bool resuming_ = false;
+    bool goal_active_ = false;
+    bool waiting_for_goal_response_ = false;
+    bool exploration_finished_ = false;
+    int no_frontier_count_ = 0;
+    rclcpp::Time goal_sent_time_;
 
-  // battery-aware parameters
-  std::string battery_topic_;
-  double energy_per_meter_;
-  double battery_safety_margin_;
-  double battery_penalty_scale_;
+    // battery-aware parameters
+    std::string battery_topic_;
+    double energy_per_meter_;
+    double battery_safety_margin_;
+    double battery_penalty_scale_;
 
-  void handleExplorationCompletion();
-};
+    void handleExplorationCompletion();
+  };
 }  // namespace explore
 
 #endif

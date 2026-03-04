@@ -17,7 +17,7 @@ endif()
 
 # Set flag depending on distro
 if(NOT DEFINED ENV{ROS_DISTRO})
-  message(FATAL_ERROR "ROS_DISTRO is not defined." )
+  message(FATAL_ERROR "ROS_DISTRO is not defined.")
 endif()
 if("$ENV{ROS_DISTRO}" STREQUAL "eloquent")
   message(STATUS "Build for ROS2 eloquent")
@@ -113,7 +113,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_explore ${catkin_LIBRARIES})
   ament_target_dependencies(test_explore ${DEPENDENCIES})
 
-  
 endif()
 
 

@@ -40,8 +40,9 @@
 
 #define private public
 
-inline static bool same_point(const geometry_msgs::msg::Point& one,
-                              const geometry_msgs::msg::Point& two)
+inline static bool same_point(
+  const geometry_msgs::msg::Point & one,
+  const geometry_msgs::msg::Point & two)
 {
   double dx = one.x - two.x;
   double dy = one.y - two.y;
@@ -51,26 +52,26 @@ inline static bool same_point(const geometry_msgs::msg::Point& one,
 
 TEST(Explore, testSameGoal)
 {
-    geometry_msgs::msg::Point goal1;
-    geometry_msgs::msg::Point goal2;
-    // Populate the goal with known values
-    goal1.x = 1.0;
-    goal1.y = 2.0;
-    goal1.z = 3.0;
+  geometry_msgs::msg::Point goal1;
+  geometry_msgs::msg::Point goal2;
+  // Populate the goal with known values
+  goal1.x = 1.0;
+  goal1.y = 2.0;
+  goal1.z = 3.0;
 
-    goal2.x = 0.0;
-    goal2.y = 0.0;
-    goal2.z = 0.0;
-    auto same_goal = same_point(goal1, goal2);
-    EXPECT_FALSE(same_goal);
-    goal2.x = goal1.x;
-    goal2.y = goal1.y;
-    goal2.z = goal1.z;
-    same_goal = same_point(goal1, goal2);
-    EXPECT_TRUE(same_goal);
+  goal2.x = 0.0;
+  goal2.y = 0.0;
+  goal2.z = 0.0;
+  auto same_goal = same_point(goal1, goal2);
+  EXPECT_FALSE(same_goal);
+  goal2.x = goal1.x;
+  goal2.y = goal1.y;
+  goal2.z = goal1.z;
+  same_goal = same_point(goal1, goal2);
+  EXPECT_TRUE(same_goal);
 }
 
-int main(int argc, char** argv)
+int main(int argc, char ** argv)
 {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

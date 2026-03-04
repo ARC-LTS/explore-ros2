@@ -12,37 +12,44 @@ using nav2_costmap_2d::FREE_SPACE;
 using nav2_costmap_2d::LETHAL_OBSTACLE;
 using nav2_costmap_2d::NO_INFORMATION;
 
-FrontierSearch::FrontierSearch(nav2_costmap_2d::Costmap2D* costmap,
-                               double potential_scale, double gain_scale,
-                               double min_frontier_size, rclcpp::Logger logger)
-  : costmap_(costmap)
+FrontierSearch::FrontierSearch(
+  nav2_costmap_2d::Costmap2D * costmap,
+  double potential_scale, double gain_scale,
+  double orientation_scale,
+  double min_frontier_size, rclcpp::Logger logger)
+: costmap_(costmap)
   , potential_scale_(potential_scale)
   , gain_scale_(gain_scale)
+  , orientation_scale_(orientation_scale)
   , min_frontier_size_(min_frontier_size)
   , logger_(logger)
 {
 }
 
 std::vector<Frontier>
-FrontierSearch::searchFrom(geometry_msgs::msg::Point position,
-                           const sensor_msgs::msg::BatteryState& battery_state,
-                           const geometry_msgs::msg::Point& home_pos,
-                           double energy_per_meter,
-                           double battery_safety_margin,
-                           double battery_penalty_scale)
+FrontierSearch::searchFrom(
+  geometry_msgs::msg::Point position,
+  double robot_yaw,
+  const sensor_msgs::msg::BatteryState & battery_state,
+  const geometry_msgs::msg::Point & home_pos,
+  double energy_per_meter,
+  double battery_safety_margin,
+  double battery_penalty_scale)
 {
   std::vector<Frontier> frontier_list;
 
   // Sanity check that robot is inside costmap bounds before searching
   unsigned int mx, my;
   if (!costmap_->worldToMap(position.x, position.y, mx, my)) {
-    RCLCPP_ERROR(logger_, "[FrontierSearch] Robot out of costmap bounds, cannot search for frontiers");
+    RCLCPP_ERROR(
+      logger_,
+      "[FrontierSearch] Robot out of costmap bounds, cannot search for frontiers");
     return frontier_list;
   }
 
   // make sure map is consistent and locked for duration of search
   std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(
-      *(costmap_->getMutex()));
+    *(costmap_->getMutex()));
 
   map_ = costmap_->getCharMap();
   size_x_ = costmap_->getSizeInCellsX();
@@ -81,7 +88,8 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position,
         frontier_flag[nbr] = true;
         Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag);
         if (new_frontier.size * costmap_->getResolution() >=
-            min_frontier_size_) {
+          min_frontier_size_)
+        {
           frontier_list.push_back(new_frontier);
         }
       }
@@ -89,19 +97,22 @@ FrontierSearch::searchFrom(geometry_msgs::msg::Point position,
   }
 
   // set costs of frontiers
-  for (auto& frontier : frontier_list) {
-    frontier.cost = frontierCost(frontier, battery_state, position, home_pos, energy_per_meter, battery_safety_margin, battery_penalty_scale);
+  for (auto & frontier : frontier_list) {
+    frontier.cost = frontierCost(
+      frontier, robot_yaw, battery_state, position, home_pos,
+      energy_per_meter, battery_safety_margin, battery_penalty_scale);
   }
   std::sort(
-      frontier_list.begin(), frontier_list.end(),
-      [](const Frontier& f1, const Frontier& f2) { return f1.cost < f2.cost; });
+    frontier_list.begin(), frontier_list.end(),
+    [](const Frontier & f1, const Frontier & f2) {return f1.cost < f2.cost;});
 
   return frontier_list;
 }
 
-Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
-                                          unsigned int reference,
-                                          std::vector<bool>& frontier_flag)
+Frontier FrontierSearch::buildNewFrontier(
+  unsigned int initial_cell,
+  unsigned int reference,
+  std::vector<bool> & frontier_flag)
 {
   // initialize frontier structure
   Frontier output;
@@ -131,8 +142,9 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
   costmap_->indexToCells(reference, rx, ry);
   costmap_->mapToWorld(rx, ry, reference_x, reference_y);
 
-  output.min_distance = sqrt(pow((double(reference_x) - double(output.initial.x)), 2.0) +
-                             pow((double(reference_y) - double(output.initial.y)), 2.0));
+  output.min_distance = sqrt(
+    pow((double(reference_x) - double(output.initial.x)), 2.0) +
+    pow((double(reference_y) - double(output.initial.y)), 2.0));
   output.middle.x = output.initial.x;
   output.middle.y = output.initial.y;
 
@@ -153,10 +165,13 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
 
         // Check for NaN or Inf values in world coordinates
         if (std::isnan(wx) || std::isinf(wx) || std::isnan(wy) || std::isinf(wy)) {
-            RCLCPP_ERROR(logger_, "[FrontierSearch] Invalid world coordinates (NaN/Inf) detected for cell (%d, %d). Skipping this point.", mx, my);
-            continue; // Skip this point, do not add it to the frontier
+          RCLCPP_ERROR(
+            logger_,
+            "[FrontierSearch] Invalid world coordinates (NaN/Inf) detected for cell (%d, %d). Skipping this point.", mx,
+            my);
+          continue;   // Skip this point, do not add it to the frontier
         }
-        
+
         geometry_msgs::msg::Point point;
         point.x = wx;
         point.y = wy;
@@ -171,8 +186,9 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
 
         // determine frontier's distance from robot, going by closest gridcell
         // to robot
-        double distance = sqrt(pow((double(reference_x) - double(wx)), 2.0) +
-                               pow((double(reference_y) - double(wy)), 2.0));
+        double distance = sqrt(
+          pow((double(reference_x) - double(wx)), 2.0) +
+          pow((double(reference_y) - double(wy)), 2.0));
         if (distance < output.min_distance) {
           output.min_distance = distance;
           output.middle.x = wx;
@@ -187,19 +203,20 @@ Frontier FrontierSearch::buildNewFrontier(unsigned int initial_cell,
 
   // average out frontier centroid
   if (output.size > 0) { // Avoid division by zero
-      output.centroid.x /= output.size;
-      output.centroid.y /= output.size;
+    output.centroid.x /= output.size;
+    output.centroid.y /= output.size;
   } else {
-      RCLCPP_WARN(logger_, "[FrontierSearch] Frontier with size 0 created. Centroid will be (0,0).");
-      // If a frontier is size 0, it shouldn't be added to the list in searchFrom anyway
-      // But for safety, ensure min_distance is infinity if size is 0
-      output.min_distance = std::numeric_limits<double>::infinity();
+    RCLCPP_WARN(logger_, "[FrontierSearch] Frontier with size 0 created. Centroid will be (0,0).");
+    // If a frontier is size 0, it shouldn't be added to the list in searchFrom anyway
+    // But for safety, ensure min_distance is infinity if size is 0
+    output.min_distance = std::numeric_limits<double>::infinity();
   }
   return output;
 }
 
-bool FrontierSearch::isNewFrontierCell(unsigned int idx,
-                                       const std::vector<bool>& frontier_flag)
+bool FrontierSearch::isNewFrontierCell(
+  unsigned int idx,
+  const std::vector<bool> & frontier_flag)
 {
   // check that cell is unknown and not already marked as frontier
   if (map_[idx] != NO_INFORMATION || frontier_flag[idx]) {
@@ -217,34 +234,52 @@ bool FrontierSearch::isNewFrontierCell(unsigned int idx,
   return false;
 }
 
-double FrontierSearch::frontierCost(const Frontier& frontier,
-                                    const sensor_msgs::msg::BatteryState& battery_state,
-                                    const geometry_msgs::msg::Point& robot_pos,
-                                    const geometry_msgs::msg::Point& home_pos,
-                                    double energy_per_meter,
-                                    double battery_safety_margin,
-                                    double battery_penalty_scale)
+double FrontierSearch::frontierCost(
+  const Frontier & frontier,
+  double robot_yaw,
+  const sensor_msgs::msg::BatteryState & battery_state,
+  const geometry_msgs::msg::Point & robot_pos,
+  const geometry_msgs::msg::Point & home_pos,
+  double energy_per_meter,
+  double battery_safety_margin,
+  double battery_penalty_scale)
 {
   // Feasibility Check
   double dist_to_frontier = frontier.min_distance;
-  double dist_to_home = std::sqrt(std::pow(frontier.centroid.x - home_pos.x, 2) + std::pow(frontier.centroid.y - home_pos.y, 2));
+  double dist_to_home =
+    std::sqrt(
+    std::pow(
+      frontier.centroid.x - home_pos.x,
+      2) + std::pow(frontier.centroid.y - home_pos.y, 2));
   double total_dist = dist_to_frontier + dist_to_home;
   double energy_cost = total_dist * energy_per_meter;
 
-  if (energy_cost > battery_state.percentage - battery_safety_margin)
-  {
+  if (energy_cost > battery_state.percentage - battery_safety_margin) {
     return std::numeric_limits<double>::infinity();
   }
 
   // Original Cost
   double original_cost = (potential_scale_ * frontier.min_distance *
-          costmap_->getResolution()) -
-         (gain_scale_ * frontier.size * costmap_->getResolution());
-  
+    costmap_->getResolution()) -
+    (gain_scale_ * frontier.size * costmap_->getResolution());
+
+  // Orientation Cost (Trajectory Awareness)
+  // Penalize frontiers that are "behind" the robot to prevent backtracking.
+  double angle_to_frontier = std::atan2(
+    frontier.centroid.y - robot_pos.y,
+    frontier.centroid.x - robot_pos.x);
+  double angle_diff = std::abs(angle_to_frontier - robot_yaw);
+  // Normalize angle_diff to [0, PI]
+  while (angle_diff > M_PI) {angle_diff -= 2.0 * M_PI;}
+  angle_diff = std::abs(angle_diff);
+
+  // penalty = orientation_scale * (1.0 - cos(angle_diff))
+  // ranges from 0 (ahead) to 2 * orientation_scale (behind)
+  double orientation_penalty = orientation_scale_ * (1.0 - std::cos(angle_diff));
+
   // Battery Penalty
   double battery_penalty = battery_penalty_scale * energy_cost;
 
-  return original_cost + battery_penalty;
+  return original_cost + orientation_penalty + battery_penalty;
 }
 }  // namespace frontier_exploration
-
