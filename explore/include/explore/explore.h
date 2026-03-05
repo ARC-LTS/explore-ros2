@@ -46,6 +46,7 @@
 #include <chrono>
 #include <cmath>
 #include <geometry_msgs/msg/point.hpp>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <rclcpp/rclcpp.hpp>
@@ -136,10 +137,14 @@ private:
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
     double prev_distance_;
+    int last_recovery_count_ = 0;
     rclcpp::Time last_progress_;
     size_t last_markers_count_;
 
     geometry_msgs::msg::Pose initial_pose_;
+    geometry_msgs::msg::Pose goal_start_pose_;
+    double last_trajectory_yaw_;
+    bool has_last_trajectory_ = false;
     sensor_msgs::msg::BatteryState latest_battery_state_;
     void returnToInitialPose(void);
 
@@ -161,6 +166,7 @@ private:
     double planner_frequency_;
     double potential_scale_, orientation_scale_, gain_scale_;
     double progress_timeout_;
+    double min_frontier_clearance_;
     bool visualize_;
     bool return_to_init_;
     int no_frontier_retry_;
@@ -171,6 +177,11 @@ private:
     bool exploration_finished_ = false;
     int no_frontier_count_ = 0;
     rclcpp::Time goal_sent_time_;
+
+    // Added for more robust goal management
+    geometry_msgs::msg::Point last_sent_goal_position_;
+    bool last_goal_successful_ = false;
+    double min_goal_distance_for_replanning_;
 
     // battery-aware parameters
     std::string battery_topic_;

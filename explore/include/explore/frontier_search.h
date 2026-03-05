@@ -52,7 +52,8 @@ public:
       const geometry_msgs::msg::Point & home_pos,
       double energy_per_meter,
       double battery_safety_margin,
-      double battery_penalty_scale);
+      double battery_penalty_scale,
+      double min_frontier_clearance = 0.0);
 
 protected:
     /**
@@ -66,7 +67,8 @@ protected:
      */
     Frontier buildNewFrontier(
       unsigned int initial_cell, unsigned int reference,
-      std::vector < bool > & frontier_flag);
+      std::vector < bool > & frontier_flag,
+      double min_frontier_clearance);
 
     /**
      * @brief isNewFrontierCell Evaluate if candidate cell is a valid candidate
@@ -78,7 +80,8 @@ protected:
      */
     bool isNewFrontierCell(
       unsigned int idx,
-      const std::vector < bool > & frontier_flag);
+      const std::vector < bool > & frontier_flag,
+      double min_frontier_clearance);
 
     /**
      * @brief computes frontier cost

@@ -34,7 +34,8 @@ FrontierSearch::searchFrom(
   const geometry_msgs::msg::Point & home_pos,
   double energy_per_meter,
   double battery_safety_margin,
-  double battery_penalty_scale)
+  double battery_penalty_scale,
+  double min_frontier_clearance)
 {
   std::vector<Frontier> frontier_list;
 
@@ -62,13 +63,15 @@ FrontierSearch::searchFrom(
   // initialize breadth first search
   std::queue<unsigned int> bfs;
 
-  // find closest clear cell to start search
+  // find closest traversable cell to start search
   unsigned int clear, pos = costmap_->getIndex(mx, my);
-  if (nearestCell(clear, pos, FREE_SPACE, *costmap_)) {
+  if (map_[pos] < LETHAL_OBSTACLE) {
+    bfs.push(pos);
+  } else if (nearestCell(clear, pos, FREE_SPACE, *costmap_)) {
     bfs.push(clear);
   } else {
     bfs.push(pos);
-    RCLCPP_WARN(logger_, "[FrontierSearch] Could not find nearby clear cell to start search");
+    RCLCPP_WARN(logger_, "[FrontierSearch] Could not find traversable cell to start search from robot position");
   }
   visited_flag[bfs.front()] = true;
 
@@ -84,9 +87,9 @@ FrontierSearch::searchFrom(
         bfs.push(nbr);
         // check if cell is new frontier cell (unvisited, NO_INFORMATION, free
         // neighbour)
-      } else if (isNewFrontierCell(nbr, frontier_flag)) {
+      } else if (isNewFrontierCell(nbr, frontier_flag, min_frontier_clearance)) {
         frontier_flag[nbr] = true;
-        Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag);
+        Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag, min_frontier_clearance);
         if (new_frontier.size * costmap_->getResolution() >=
           min_frontier_size_)
         {
@@ -112,7 +115,8 @@ FrontierSearch::searchFrom(
 Frontier FrontierSearch::buildNewFrontier(
   unsigned int initial_cell,
   unsigned int reference,
-  std::vector<bool> & frontier_flag)
+  std::vector<bool> & frontier_flag,
+  double min_frontier_clearance)
 {
   // initialize frontier structure
   Frontier output;
@@ -155,7 +159,7 @@ Frontier FrontierSearch::buildNewFrontier(
     // try adding cells in 8-connected neighborhood to frontier
     for (unsigned int nbr : nhood8(idx, *costmap_)) {
       // check if neighbour is a potential frontier cell
-      if (isNewFrontierCell(nbr, frontier_flag)) {
+      if (isNewFrontierCell(nbr, frontier_flag, min_frontier_clearance)) {
         // mark cell as frontier
         frontier_flag[nbr] = true;
         unsigned int mx, my;
@@ -216,7 +220,8 @@ Frontier FrontierSearch::buildNewFrontier(
 
 bool FrontierSearch::isNewFrontierCell(
   unsigned int idx,
-  const std::vector<bool> & frontier_flag)
+  const std::vector<bool> & frontier_flag,
+  double min_frontier_clearance)
 {
   // check that cell is unknown and not already marked as frontier
   if (map_[idx] != NO_INFORMATION || frontier_flag[idx]) {
@@ -224,10 +229,18 @@ bool FrontierSearch::isNewFrontierCell(
   }
 
   // frontier cells should have at least one cell in 4-connected neighbourhood
-  // that is free
+  // that is free and has enough clearance
   for (unsigned int nbr : nhood4(idx, *costmap_)) {
     if (map_[nbr] < LETHAL_OBSTACLE) {
-      return true;
+        if (min_frontier_clearance <= 0) {
+            return true;
+        }
+        // If clearance is requested, we check if the neighbor's cost is low enough.
+        // A cost of 0 (FREE_SPACE) is the safest.
+        // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles.
+        if (map_[nbr] < 50) {
+            return true;
+        }
     }
   }
 
@@ -263,8 +276,8 @@ double FrontierSearch::frontierCost(
     costmap_->getResolution()) -
     (gain_scale_ * frontier.size * costmap_->getResolution());
 
-  // Orientation Cost (Trajectory Awareness)
-  // Penalize frontiers that are "behind" the robot to prevent backtracking.
+  // Orientation Cost (Trajectory/Orientation Awareness)
+  // Sharply penalize frontiers that are "behind" the robot to prevent backtracking.
   double angle_to_frontier = std::atan2(
     frontier.centroid.y - robot_pos.y,
     frontier.centroid.x - robot_pos.x);
@@ -273,12 +286,28 @@ double FrontierSearch::frontierCost(
   while (angle_diff > M_PI) {angle_diff -= 2.0 * M_PI;}
   angle_diff = std::abs(angle_diff);
 
-  // penalty = orientation_scale * (1.0 - cos(angle_diff))
-  // ranges from 0 (ahead) to 2 * orientation_scale (behind)
-  double orientation_penalty = orientation_scale_ * (1.0 - std::cos(angle_diff));
+  // Use a quadratic penalty for backtracking beyond a certain threshold (e.g., 60 degrees)
+  double orientation_penalty = 0;
+  if (orientation_scale_ > 0) {
+    if (angle_diff > M_PI / 3.0) { // > 60 degrees
+        // Quadratic penalty: grows quickly as we look further behind
+        double normalized_diff = angle_diff / (M_PI / 3.0);
+        orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
+    } else {
+        // Light linear penalty for small deviations
+        orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
+    }
+  }
 
-  // Battery Penalty
-  double battery_penalty = battery_penalty_scale * energy_cost;
+  // Battery Penalty (Safety Awareness)
+  // Only apply a strong penalty if battery is significantly depleted or if we are very far from home.
+  double battery_penalty = 0;
+  if (battery_penalty_scale > 0) {
+      // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
+      double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
+      double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) * energy_per_meter;
+      battery_penalty = battery_penalty_scale * adjusted_energy_cost;
+  }
 
   return original_cost + orientation_penalty + battery_penalty;
 }
