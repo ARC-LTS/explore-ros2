@@ -88,6 +88,11 @@ Explore::Explore()
   this->declare_parameter<double>("battery_safety_margin", 0.1);
   this->declare_parameter<double>("battery_penalty_scale", 0.0);
   this->declare_parameter<double>("min_goal_distance_for_replanning", 0.75); // New parameter
+  this->declare_parameter<double>("min_battery_percentage", 0.1);
+  this->declare_parameter<std::string>("radiation_topic", "rad");
+  this->declare_parameter<double>("max_radiation_dose", 100.0);
+  this->declare_parameter<int>("max_verification_attempts", 3);
+  this->declare_parameter<double>("max_battery_used", 0.9);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -105,6 +110,12 @@ Explore::Explore()
   this->get_parameter("battery_safety_margin", battery_safety_margin_);
   this->get_parameter("battery_penalty_scale", battery_penalty_scale_);
   this->get_parameter("min_goal_distance_for_replanning", min_goal_distance_for_replanning_); // Get new parameter
+  this->get_parameter("min_battery_percentage", min_battery_percentage_);
+  this->get_parameter("radiation_topic", radiation_topic_);
+  this->get_parameter("max_radiation_dose", max_radiation_dose_);
+  this->get_parameter("max_verification_attempts", max_verification_attempts_);
+  this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("max_battery_used", max_battery_used_);
 
   // Initialize new member variables
   last_sent_goal_position_.x = initial_pose_.position.x;
@@ -140,6 +151,11 @@ Explore::Explore()
   battery_sub_ = this->create_subscription<sensor_msgs::msg::BatteryState>(
     battery_topic_, 10,
     std::bind(&Explore::batteryCallback, this, std::placeholders::_1));
+
+  radiation_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+    radiation_topic_, 10,
+    std::bind(&Explore::radiationCallback, this, std::placeholders::_1));
+  last_radiation_update_ = this->now();
 
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
@@ -244,6 +260,40 @@ void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
 void Explore::batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg)
 {
   latest_battery_state_ = *msg;
+  bool battery_low = latest_battery_state_.percentage < min_battery_percentage_;
+  bool battery_used_up = (1.0 - latest_battery_state_.percentage) > max_battery_used_;
+
+  if (!exploration_finished_ && (battery_low || battery_used_up)) {
+    if (battery_low) {
+        RCLCPP_WARN(logger_, "Battery level %.2f below threshold %.2f. Returning to origin.", 
+                    latest_battery_state_.percentage, min_battery_percentage_);
+    } else {
+        RCLCPP_WARN(logger_, "Battery used %.2f exceeds threshold %.2f. Returning to origin.", 
+                    1.0 - latest_battery_state_.percentage, max_battery_used_);
+    }
+    handleExplorationCompletion(true);
+  }
+}
+
+void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+{
+  if (msg->data.size() < 2) return;
+  
+  double mR_hr = msg->data[1];
+  rclcpp::Time now = this->now();
+  double dt = (now - last_radiation_update_).seconds();
+  last_radiation_update_ = now;
+
+  if (dt > 0.0 && dt < 10.0) { // Sanity check for dt
+    // Dose (mR) = rate (mR/hr) * time (hr)
+    cumulative_dose_ += mR_hr * (dt / 3600.0);
+  }
+
+  if (!exploration_finished_ && cumulative_dose_ > max_radiation_dose_) {
+    RCLCPP_WARN(logger_, "Cumulative radiation dose %.2f mR exceeded threshold %.2f mR. Returning to origin.", 
+                cumulative_dose_, max_radiation_dose_);
+    handleExplorationCompletion(true);
+  }
 }
 
 void Explore::visualizeFrontiers(
@@ -399,7 +449,8 @@ void Explore::makePlan()
     battery_safety_margin_, battery_penalty_scale_,
     min_frontier_clearance_);
 
-  RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
+  RCLCPP_INFO(logger_, "Status: Explored %d frontiers, %lu currently available.", 
+              frontiers_explored_count_, frontiers.size());
   if (visualize_) {
     visualizeFrontiers(frontiers);
   }
@@ -420,60 +471,23 @@ void Explore::makePlan()
       return false;
     });
 
-  // --- Stage 4: Handle no valid frontiers (with random move recovery) ---
+  // --- Stage 4: Handle no valid frontiers (with robust verification) ---
   if (frontiers.empty() || frontier == frontiers.end()) {
     no_frontier_count_++;
     if (no_frontier_count_ >= no_frontier_retry_) {
-      RCLCPP_WARN(logger_, "No valid frontiers found after %d retries. Attempting a random move recovery.", no_frontier_count_);
-      
-      geometry_msgs::msg::Point recovery_goal;
-      bool found_recovery_goal = false;
-      double recovery_distance = 1.5;
-
-      for (int i = 0; i < 8; ++i) {
-        double angle = i * (2.0 * M_PI / 8.0);
-        recovery_goal.x = pose.position.x + recovery_distance * cos(angle);
-        recovery_goal.y = pose.position.y + recovery_distance * sin(angle);
-
-        unsigned int mx, my;
-        if (costmap_client_.getCostmap()->worldToMap(recovery_goal.x, recovery_goal.y, mx, my) &&
-            costmap_client_.getCostmap()->getCost(mx, my) < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-          found_recovery_goal = true;
-          break;
-        }
-      }
-
-      if (found_recovery_goal) {
-        RCLCPP_INFO(logger_, "Sending recovery goal to (%.2f, %.2f) to find new frontiers.", recovery_goal.x, recovery_goal.y);
-        auto goal = nav2_msgs::action::NavigateToPose::Goal();
-        goal.pose.pose.position = recovery_goal;
-        goal.pose.pose.orientation = pose.orientation;
-        goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-        goal.pose.header.stamp = this->now();
-
-        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-        send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, recovery_goal);
-        send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
-        send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
-
-        waiting_for_goal_response_ = true;
-        move_base_client_->async_send_goal(goal, send_goal_options);
-        
-        last_sent_goal_position_ = recovery_goal;
-        goal_start_pose_ = pose;
-        last_progress_ = this->now();
-        prev_distance_ = std::numeric_limits<double>::infinity();
-        no_frontier_count_ = 0; // Reset counter after sending recovery goal
-        return;
-      } else {
-        RCLCPP_ERROR(logger_, "Random move recovery failed: no valid points found around the robot.");
-        handleExplorationCompletion();
-      }
+      RCLCPP_WARN(logger_, "No valid frontiers found after %d retries. Explored %d frontiers. Starting verification phase.", 
+                  no_frontier_count_, frontiers_explored_count_);
+      no_frontier_count_ = 0;
+      startVerification();
     } else {
       RCLCPP_INFO(logger_, "No valid frontiers found, retry %d/%d", no_frontier_count_, no_frontier_retry_);
     }
     return;
   }
+
+  // Frontiers found, reset verification state
+  is_verifying_ = false;
+  verification_attempts_ = 0;
   
   geometry_msgs::msg::Point target_position = frontier->middle;
 
@@ -506,7 +520,7 @@ void Explore::makePlan()
   last_goal_successful_ = false;
 }
 
-void Explore::handleExplorationCompletion()
+void Explore::handleExplorationCompletion(bool force_return)
 {
   if (exploration_finished_) {
     return;
@@ -521,12 +535,79 @@ void Explore::handleExplorationCompletion()
   exploring_timer_->cancel(); // Stop the main planning loop
   goal_active_ = false; // Ensure goal active state is reset
 
-  // 2. Return to original pose, if configured
-  if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Initiating return to initial pose as exploration finished.");
+  // 2. Return to original pose, if configured or forced
+  if (return_to_init_ || force_return) {
+    RCLCPP_INFO(logger_, "Initiating return to initial pose.");
     returnToInitialPose(); // This function already handles sending the goal
   } else {
-    RCLCPP_INFO(logger_, "Robot will remain at current position as return_to_init is false.");
+    RCLCPP_INFO(logger_, "Robot will remain at current position.");
+  }
+}
+
+void Explore::startVerification()
+{
+  if (verification_attempts_ >= max_verification_attempts_) {
+    RCLCPP_WARN(logger_, "Verification phase complete after %d attempts. No new frontiers found. Believing completion.", 
+                verification_attempts_);
+    handleExplorationCompletion(true);
+    return;
+  }
+
+  is_verifying_ = true;
+  verification_attempts_++;
+  
+  RCLCPP_INFO(logger_, "Starting verification attempt %d/%d to ensure no regions were missed. Explored %d frontiers so far.", 
+              verification_attempts_, max_verification_attempts_, frontiers_explored_count_);
+
+  auto pose = costmap_client_.getRobotPose();
+  geometry_msgs::msg::Point verification_goal;
+  bool found_goal = false;
+  
+  // Systematically check different directions (N, S, E, W, NE, NW, SE, SW)
+  double angles[] = {0.0, M_PI, M_PI / 2.0, -M_PI / 2.0, M_PI / 4.0, 3.0 * M_PI / 4.0, -M_PI / 4.0, -3.0 * M_PI / 4.0};
+  int start_angle_idx = (verification_attempts_ - 1) % 8;
+  double search_distance = 4.0 + 4.0 * ((verification_attempts_ - 1) / 2); // Increase distance every 2 attempts
+
+  for (int i = 0; i < 8; ++i) {
+    int idx = (start_angle_idx + i) % 8;
+    double angle = angles[idx];
+    verification_goal.x = pose.position.x + search_distance * cos(angle);
+    verification_goal.y = pose.position.y + search_distance * sin(angle);
+
+    unsigned int mx, my;
+    if (costmap_client_.getCostmap()->worldToMap(verification_goal.x, verification_goal.y, mx, my)) {
+      unsigned char cost = costmap_client_.getCostmap()->getCost(mx, my);
+      if (cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        found_goal = true;
+        break;
+      }
+    }
+  }
+
+  if (found_goal) {
+    RCLCPP_INFO(logger_, "Verification: Traversing to region at (%.2f, %.2f) to check for missing frontiers.", 
+                verification_goal.x, verification_goal.y);
+    auto goal = nav2_msgs::action::NavigateToPose::Goal();
+    goal.pose.pose.position = verification_goal;
+    goal.pose.pose.orientation = pose.orientation;
+    goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.pose.header.stamp = this->now();
+
+    auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+    send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, verification_goal);
+    send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
+    send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
+
+    waiting_for_goal_response_ = true;
+    move_base_client_->async_send_goal(goal, send_goal_options);
+    
+    last_sent_goal_position_ = verification_goal;
+    goal_start_pose_ = pose;
+    last_progress_ = this->now();
+    prev_distance_ = std::numeric_limits<double>::infinity();
+  } else {
+    RCLCPP_WARN(logger_, "Verification: Could not find a valid goal in attempt %d. Trying next attempt.", verification_attempts_);
+    startVerification(); // Recursive call to next attempt
   }
 }
 
@@ -628,6 +709,9 @@ void Explore::resultCallback(
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_INFO(logger_, "Navigation goal to (%.2f, %.2f) SUCCEEDED.", frontier_goal.x, frontier_goal.y);
       last_goal_successful_ = true;
+      if (!is_verifying_) {
+        frontiers_explored_count_++;
+      }
       break;
     case rclcpp_action::ResultCode::ABORTED:
       if (waiting_for_goal_response_) {

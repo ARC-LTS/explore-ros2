@@ -57,6 +57,7 @@
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -134,6 +135,9 @@ private:
     rclcpp::Subscription < sensor_msgs::msg::BatteryState > ::SharedPtr battery_sub_;
     void batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg);
 
+    rclcpp::Subscription < std_msgs::msg::Float64MultiArray > ::SharedPtr radiation_sub_;
+    void radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
     double prev_distance_;
@@ -146,6 +150,11 @@ private:
     double last_trajectory_yaw_;
     bool has_last_trajectory_ = false;
     sensor_msgs::msg::BatteryState latest_battery_state_;
+    double cumulative_dose_ = 0.0;
+    rclcpp::Time last_radiation_update_;
+    int frontiers_explored_count_ = 0;
+    bool is_verifying_ = false;
+    int verification_attempts_ = 0;
     void returnToInitialPose(void);
 
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
@@ -188,8 +197,18 @@ private:
     double energy_per_meter_;
     double battery_safety_margin_;
     double battery_penalty_scale_;
+    double min_battery_percentage_;
+    double max_battery_used_;
 
-    void handleExplorationCompletion();
+    // radiation parameters
+    std::string radiation_topic_;
+    double max_radiation_dose_;
+
+    // verification parameters
+    int max_verification_attempts_;
+
+    void handleExplorationCompletion(bool force_return = false);
+    void startVerification();
   };
 }  // namespace explore
 

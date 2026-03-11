@@ -18,4 +18,7 @@
     energy_per_meter: 0.1
     battery_safety_margin: 0.1
     battery_penalty_scale: 1.0
+    max_battery_used: 0.8
+    max_radiation_dose: 100.0
+    max_verification_attempts: 5
     min_goal_distance_for_replanning: 0.75
