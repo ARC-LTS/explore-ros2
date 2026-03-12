@@ -91,6 +91,9 @@ Explore::Explore()
   this->declare_parameter<double>("min_battery_percentage", 0.1);
   this->declare_parameter<std::string>("radiation_topic", "rad");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
+  this->declare_parameter<double>("critical_dose_rate", 2.0);
+  this->declare_parameter<double>("safe_dose_rate_threshold", 0.25);
+  this->declare_parameter<double>("radiation_weight", 10.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
   this->declare_parameter<double>("max_battery_used", 0.9);
 
@@ -113,6 +116,9 @@ Explore::Explore()
   this->get_parameter("min_battery_percentage", min_battery_percentage_);
   this->get_parameter("radiation_topic", radiation_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
+  this->get_parameter("critical_dose_rate", critical_dose_rate_);
+  this->get_parameter("safe_dose_rate_threshold", safe_dose_rate_threshold_);
+  this->get_parameter("radiation_weight", radiation_weight_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
   this->get_parameter("max_battery_used", max_battery_used_);
@@ -130,6 +136,7 @@ Explore::Explore()
 
   search_ = frontier_exploration::FrontierSearch(
     costmap_client_.getCostmap(),
+    costmap_client_.getRadiationCostmap(),
     potential_scale_, gain_scale_,
     orientation_scale_,
     min_frontier_size, logger_);
@@ -142,6 +149,8 @@ Explore::Explore()
       "s",
       10);
   }
+
+  explored_map_publisher_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("~/explored_map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
 
   // Subscription to resume or stop exploration
   resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
@@ -182,6 +191,10 @@ Explore::Explore()
   exploring_timer_ = this->create_wall_timer(
     std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
     [this]() {makePlan();});
+
+  explored_map_timer_ = this->create_wall_timer(
+    std::chrono::seconds(1),
+    [this]() {updateExploredMap();});
 
   if (auto_start) {
     RCLCPP_INFO(logger_, "Exploration starting automatically.");
@@ -289,11 +302,67 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
     cumulative_dose_ += mR_hr * (dt / 3600.0);
   }
 
-  if (!exploration_finished_ && cumulative_dose_ > max_radiation_dose_) {
-    RCLCPP_WARN(logger_, "Cumulative radiation dose %.2f mR exceeded threshold %.2f mR. Returning to origin.", 
-                cumulative_dose_, max_radiation_dose_);
-    handleExplorationCompletion(true);
+  // Track gradient relative to a baseline pose
+  auto current_pose = costmap_client_.getRobotPose();
+  double dx_baseline = current_pose.position.x - rad_baseline_pose_.x;
+  double dy_baseline = current_pose.position.y - rad_baseline_pose_.y;
+  double dist_baseline = std::sqrt(dx_baseline*dx_baseline + dy_baseline*dy_baseline);
+
+  // If we've moved significantly from the last baseline or radiation has dropped significantly, reset baseline
+  if (dist_baseline > 1.0 || mR_hr < rad_baseline_val_ - 0.2) { // Reset baseline every 1m
+      rad_baseline_val_ = mR_hr;
+      rad_baseline_pose_ = current_pose.position;
+  } 
+  // Otherwise, if radiation is increasing relative to baseline, update gradient
+  else if (mR_hr > rad_baseline_val_ + 0.05 && dist_baseline > 0.2) {
+      has_rad_gradient_ = true;
+      rad_gradient_vec_.x = dx_baseline / dist_baseline; // Normalized
+      rad_gradient_vec_.y = dy_baseline / dist_baseline;
+      last_gradient_update_time_ = now;
+      RCLCPP_DEBUG(logger_, "Radiation increasing relative to baseline (%.2f -> %.2f). Gradient dir: (%.2f, %.2f)", 
+                   rad_baseline_val_, mR_hr, rad_gradient_vec_.x, rad_gradient_vec_.y);
   }
+
+  // Gradient Decay: if we haven't seen an increase in a while, stop biasing
+  if (has_rad_gradient_ && (now - last_gradient_update_time_).seconds() > 5.0) { // Shorter decay
+      has_rad_gradient_ = false;
+      RCLCPP_INFO(logger_, "Radiation gradient stale. Resetting.");
+  }
+
+  if (!exploration_finished_) {
+    if (cumulative_dose_ > max_radiation_dose_) {
+      RCLCPP_WARN(logger_, "Cumulative radiation dose %.2f mR exceeded threshold %.2f mR. Returning to origin.", 
+                  cumulative_dose_, max_radiation_dose_);
+      handleExplorationCompletion(true);
+    } else if (mR_hr > critical_dose_rate_ && !is_evacuating_) {
+      RCLCPP_WARN(logger_, "Critical radiation dose rate %.2f mR/hr detected! Evacuating to origin.", mR_hr);
+      triggerEvacuation();
+    } else if (is_evacuating_ && mR_hr < safe_dose_rate_threshold_) {
+      RCLCPP_INFO(logger_, "Radiation dose rate %.2f mR/hr is now below safe threshold %.2f mR/hr. Resuming exploration.", 
+                  mR_hr, safe_dose_rate_threshold_);
+      resumeExploration();
+    }
+  }
+}
+
+void Explore::triggerEvacuation()
+{
+  is_evacuating_ = true;
+  // Cancel current navigation goal
+  if (goal_active_ || waiting_for_goal_response_) {
+    move_base_client_->async_cancel_all_goals();
+    goal_active_ = false;
+    waiting_for_goal_response_ = false;
+  }
+  // Return to initial pose
+  returnToInitialPose();
+}
+
+void Explore::resumeExploration()
+{
+  is_evacuating_ = false;
+  // Trigger a new plan immediately
+  makePlan();
 }
 
 void Explore::visualizeFrontiers(
@@ -355,9 +424,9 @@ void Explore::visualizeFrontiers(
     m.type = visualization_msgs::msg::Marker::POINTS;
     m.id = int(id);
     m.pose.position = geometry_msgs::msg::Point();
-    m.scale.x = 0.1;
-    m.scale.y = 0.1;
-    m.scale.z = 0.1;
+    m.scale.x = 0.25; // Increased from 0.1
+    m.scale.y = 0.25;
+    m.scale.z = 0.25;
     m.points = frontier.points;
     if (goalOnBlacklist(frontier.centroid)) {
       m.color = red;
@@ -393,7 +462,7 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
-  if (exploration_finished_) {
+  if (exploration_finished_ || is_evacuating_) {
     return;
   }
 
@@ -443,11 +512,17 @@ void Explore::makePlan()
     search_yaw = last_trajectory_yaw_;
   }
 
-  auto frontiers = search_.searchFrom(
-    pose.position, search_yaw, latest_battery_state_,
-    initial_pose_.position, energy_per_meter_,
-    battery_safety_margin_, battery_penalty_scale_,
-    min_frontier_clearance_);
+  std::vector<frontier_exploration::Frontier> frontiers;
+  {
+      std::lock_guard<std::mutex> lock(explored_map_mutex_);
+      frontiers = search_.searchFrom(
+        pose.position, search_yaw, latest_battery_state_,
+        initial_pose_.position, energy_per_meter_,
+        battery_safety_margin_, battery_penalty_scale_,
+        explored_map_,
+        min_frontier_clearance_, radiation_weight_,
+        has_rad_gradient_, rad_gradient_vec_);
+  }
 
   RCLCPP_INFO(logger_, "Status: Explored %d frontiers, %lu currently available.", 
               frontiers_explored_count_, frontiers.size());
@@ -471,11 +546,11 @@ void Explore::makePlan()
       return false;
     });
 
-  // --- Stage 4: Handle no valid frontiers (with robust verification) ---
+  // --- Stage 4: Handle no valid frontiers ---
   if (frontiers.empty() || frontier == frontiers.end()) {
     no_frontier_count_++;
     if (no_frontier_count_ >= no_frontier_retry_) {
-      RCLCPP_WARN(logger_, "No valid frontiers found after %d retries. Explored %d frontiers. Starting verification phase.", 
+      RCLCPP_WARN(logger_, "No valid frontiers found after %d retries. Explored %d frontiers.", 
                   no_frontier_count_, frontiers_explored_count_);
       no_frontier_count_ = 0;
       startVerification();
@@ -525,6 +600,13 @@ void Explore::handleExplorationCompletion(bool force_return)
   if (exploration_finished_) {
     return;
   }
+
+  // If we are currently tracking a radiation source, don't finish yet!
+  if (!force_return && has_rad_gradient_) {
+      RCLCPP_INFO(logger_, "Exploration might be done, but we are still tracking a radiation source. Continuing.");
+      return;
+  }
+
   exploration_finished_ = true;
 
   RCLCPP_WARN(logger_, "Exploration finished: no more frontiers found or all traversed/tried out.");
@@ -547,7 +629,7 @@ void Explore::handleExplorationCompletion(bool force_return)
 void Explore::startVerification()
 {
   if (verification_attempts_ >= max_verification_attempts_) {
-    RCLCPP_WARN(logger_, "Verification phase complete after %d attempts. No new frontiers found. Believing completion.", 
+    RCLCPP_WARN(logger_, "Verification phase complete after %d attempts. No new frontiers found.", 
                 verification_attempts_);
     handleExplorationCompletion(true);
     return;
@@ -772,6 +854,73 @@ void Explore::resume()
   exploring_timer_->reset();
   // Resume immediately
   makePlan();
+}
+
+void Explore::updateExploredMap()
+{
+  nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
+  if (!costmap) return;
+
+  std::lock_guard<std::mutex> lock(explored_map_mutex_);
+  
+  // Handle Map Initialization or Resizing with Data Preservation
+  if (explored_map_.data.empty() || 
+      explored_map_.info.width != costmap->getSizeInCellsX() ||
+      explored_map_.info.height != costmap->getSizeInCellsY() ||
+      std::abs(explored_map_.info.origin.position.x - costmap->getOriginX()) > 1e-3 ||
+      std::abs(explored_map_.info.origin.position.y - costmap->getOriginY()) > 1e-3) {
+      
+      nav_msgs::msg::OccupancyGrid new_map;
+      new_map.header.frame_id = costmap_client_.getGlobalFrameID();
+      new_map.info.resolution = costmap->getResolution();
+      new_map.info.width = costmap->getSizeInCellsX();
+      new_map.info.height = costmap->getSizeInCellsY();
+      new_map.info.origin.position.x = costmap->getOriginX();
+      new_map.info.origin.position.y = costmap->getOriginY();
+      new_map.info.origin.orientation.w = 1.0;
+      new_map.data.assign(new_map.info.width * new_map.info.height, 0);
+
+      // Remap old data to new map
+      if (!explored_map_.data.empty()) {
+          for (unsigned int y = 0; y < explored_map_.info.height; ++y) {
+              for (unsigned int x = 0; x < explored_map_.info.width; ++x) {
+                  if (explored_map_.data[y * explored_map_.info.width + x] == 100) {
+                      double wx = explored_map_.info.origin.position.x + (x + 0.5) * explored_map_.info.resolution;
+                      double wy = explored_map_.info.origin.position.y + (y + 0.5) * explored_map_.info.resolution;
+                      unsigned int nx, ny;
+                      if (costmap->worldToMap(wx, wy, nx, ny)) {
+                          new_map.data[ny * new_map.info.width + nx] = 100;
+                      }
+                  }
+              }
+          }
+      }
+      explored_map_ = new_map;
+      RCLCPP_INFO(logger_, "Explored map resized and historical data preserved.");
+  }
+
+  auto pose = costmap_client_.getRobotPose();
+  unsigned int mx, my;
+  if (costmap->worldToMap(pose.position.x, pose.position.y, mx, my)) {
+      double radius = 0.75; // Smaller radius for more diligent coverage
+      int cell_radius = radius / costmap->getResolution();
+      
+      for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
+          for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
+              if (dx*dx + dy*dy <= cell_radius*cell_radius) {
+                  int nx = static_cast<int>(mx) + dx;
+                  int ny = static_cast<int>(my) + dy;
+                  if (nx >= 0 && nx < static_cast<int>(explored_map_.info.width) &&
+                      ny >= 0 && ny < static_cast<int>(explored_map_.info.height)) {
+                      explored_map_.data[ny * explored_map_.info.width + nx] = 100;
+                  }
+              }
+          }
+      }
+  }
+
+  explored_map_.header.stamp = this->now();
+  explored_map_publisher_->publish(explored_map_);
 }
 
 }  // namespace explore

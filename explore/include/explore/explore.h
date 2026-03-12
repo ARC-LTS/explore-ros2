@@ -118,6 +118,7 @@ private:
 
     rclcpp::Publisher < visualization_msgs::msg::MarkerArray > ::SharedPtr
     marker_array_publisher_;
+    rclcpp::Publisher < nav_msgs::msg::OccupancyGrid > ::SharedPtr explored_map_publisher_;
     rclcpp::Logger logger_;
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
@@ -127,6 +128,7 @@ private:
     move_base_client_;
     frontier_exploration::FrontierSearch search_;
     rclcpp::TimerBase::SharedPtr exploring_timer_;
+    rclcpp::TimerBase::SharedPtr explored_map_timer_;
     // rclcpp::TimerBase::SharedPtr oneshot_;
 
     rclcpp::Subscription < std_msgs::msg::Bool > ::SharedPtr resume_subscription_;
@@ -152,9 +154,19 @@ private:
     sensor_msgs::msg::BatteryState latest_battery_state_;
     double cumulative_dose_ = 0.0;
     rclcpp::Time last_radiation_update_;
+    double rad_baseline_val_ = 0.0;
+    geometry_msgs::msg::Point rad_baseline_pose_;
+    rclcpp::Time last_gradient_update_time_{0, 0, RCL_ROS_TIME};
+    bool has_rad_gradient_ = false;
+    geometry_msgs::msg::Point rad_gradient_vec_;
+    bool is_evacuating_ = false;
     int frontiers_explored_count_ = 0;
     bool is_verifying_ = false;
     int verification_attempts_ = 0;
+
+    nav_msgs::msg::OccupancyGrid explored_map_;
+    std::mutex explored_map_mutex_;
+    void updateExploredMap();
     void returnToInitialPose(void);
 
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
@@ -203,12 +215,17 @@ private:
     // radiation parameters
     std::string radiation_topic_;
     double max_radiation_dose_;
+    double critical_dose_rate_;
+    double safe_dose_rate_threshold_;
+    double radiation_weight_;
 
     // verification parameters
     int max_verification_attempts_;
 
     void handleExplorationCompletion(bool force_return = false);
     void startVerification();
+    void triggerEvacuation();
+    void resumeExploration();
   };
 }  // namespace explore
 

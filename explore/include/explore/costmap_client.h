@@ -82,14 +82,19 @@ public:
     }
 
     /**
-     * @brief Return a pointer to the "master" costmap which receives updates from
-     * all the layers.
-     *
-     * This pointer will stay the same for the lifetime of Costmap2DClient object.
+     * @brief Return a pointer to the radiation costmap.
      */
-    const nav2_costmap_2d::Costmap2D * getCostmap() const
+    nav2_costmap_2d::Costmap2D * getRadiationCostmap()
     {
-      return &costmap_;
+      return &radiation_costmap_;
+    }
+
+    /**
+     * @brief Return a pointer to the radiation costmap.
+     */
+    const nav2_costmap_2d::Costmap2D * getRadiationCostmap() const
+    {
+      return &radiation_costmap_;
     }
 
     /**
@@ -113,10 +118,13 @@ public:
 protected:
     void updateFullMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
     void updatePartialMap(const map_msgs::msg::OccupancyGridUpdate::SharedPtr msg);
+    void updateRadiationMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
     nav2_costmap_2d::Costmap2D costmap_;
+    nav2_costmap_2d::Costmap2D radiation_costmap_;
     bool costmap_received_ = false; ///< @brief Flag indicating whether costmap
                                     ///< callback has been called
+    bool radiation_map_received_ = false;
 
     const tf2_ros::Buffer * const tf_; ///< @brief Used for transforming
                                        /// point clouds
@@ -130,6 +138,7 @@ private:
     rclcpp::Subscription < nav_msgs::msg::OccupancyGrid > ::SharedPtr costmap_sub_;
     rclcpp::Subscription < map_msgs::msg::OccupancyGridUpdate > ::SharedPtr
     costmap_updates_sub_;
+    rclcpp::Subscription < nav_msgs::msg::OccupancyGrid > ::SharedPtr radiation_costmap_sub_;
   };
 
 }  // namespace explore
