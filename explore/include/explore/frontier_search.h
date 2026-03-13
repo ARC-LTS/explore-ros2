@@ -16,6 +16,7 @@ namespace frontier_exploration
     std::uint32_t size;
     double min_distance;
     double cost;
+    double info_gain;
     geometry_msgs::msg::Point initial;
     geometry_msgs::msg::Point centroid;
     geometry_msgs::msg::Point middle;
@@ -96,7 +97,7 @@ protected:
      * @return cost of the frontier
      */
     double frontierCost(
-      const Frontier & frontier,
+      Frontier & frontier,
       double robot_yaw,
       const sensor_msgs::msg::BatteryState & battery_state,
       const geometry_msgs::msg::Point & robot_pos,

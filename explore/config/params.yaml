@@ -12,7 +12,8 @@
     orientation_scale: 2.0
     gain_scale: 1.0
     transform_tolerance: 0.3
-    min_frontier_size: 1.0
+    min_frontier_size: 0.5
+    min_frontier_clearance: 0.0
     no_frontier_retry: 3
     battery_topic: /battery_state
     energy_per_meter: 0.1

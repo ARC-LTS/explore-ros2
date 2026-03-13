@@ -242,8 +242,8 @@ bool FrontierSearch::isNewFrontierCell(
         }
         // If clearance is requested, we check if the neighbor's cost is low enough.
         // A cost of 0 (FREE_SPACE) is the safest.
-        // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles.
-        if (map_[nbr] < 50) {
+        // As a heuristic, we'll use a threshold of 100 to ensure some distance from obstacles while being more tolerant.
+        if (map_[nbr] < 100) {
             return true;
         }
     }
@@ -253,7 +253,7 @@ bool FrontierSearch::isNewFrontierCell(
 }
 
 double FrontierSearch::frontierCost(
-  const Frontier & frontier,
+  Frontier & frontier,
   double robot_yaw,
   const sensor_msgs::msg::BatteryState & battery_state,
   const geometry_msgs::msg::Point & robot_pos,
@@ -266,6 +266,7 @@ double FrontierSearch::frontierCost(
   double radiation_gradient_scale,
   const cv::Mat& explored_grid)
 {
+  frontier.info_gain = 0.0;
   // Feasibility Check
   double dist_to_frontier = frontier.min_distance;
   double dist_to_home =
@@ -310,6 +311,8 @@ double FrontierSearch::frontierCost(
         }
       }
     }
+    // Store gain for visualization
+    frontier.info_gain = unknown_cells_visible * res * res;
     // Subtract from cost (higher gain = lower cost)
     info_gain_cost = -gain_scale_ * unknown_cells_visible * res;
   }

@@ -147,6 +147,11 @@ Explore::Explore()
       "frontier"
       "s",
       10);
+    explored_area_publisher_ =
+      this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "explore/"
+      "explored_area",
+      rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
   }
 
   // Subscription to resume or stop exploration
@@ -361,6 +366,26 @@ void Explore::updateExploredArea()
   double area = explored_count * res * res;
   RCLCPP_INFO_THROTTLE(logger_, *this->get_clock(), 5000, 
                        "Explored Area: %.2f m^2 (%d cells)", area, explored_count);
+
+  // Publish the explored area map for visualization
+  if (visualize_ && explored_area_publisher_) {
+    nav_msgs::msg::OccupancyGrid msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = costmap_client_.getGlobalFrameID();
+    msg.info.resolution = res;
+    msg.info.width = costmap->getSizeInCellsX();
+    msg.info.height = costmap->getSizeInCellsY();
+    msg.info.origin.position.x = costmap->getOriginX();
+    msg.info.origin.position.y = costmap->getOriginY();
+    msg.info.origin.orientation.w = 1.0;
+    msg.data.resize(msg.info.width * msg.info.height);
+
+    for (size_t i = 0; i < msg.data.size(); ++i) {
+      // Map CV_8UC1 (0 or 255) to OccupancyGrid (0 or 100)
+      msg.data[i] = (explored_grid_.data[i] > 0) ? 100 : 0;
+    }
+    explored_area_publisher_->publish(msg);
+  }
 }
 
 void Explore::visualizeFrontiers(
@@ -411,6 +436,10 @@ void Explore::visualizeFrontiers(
 
   // weighted frontiers are always sorted
   double min_cost = frontiers.empty() ? 0. : frontiers.front().cost;
+  double max_gain = 0.0;
+  for (const auto& f : frontiers) {
+    if (f.info_gain > max_gain) max_gain = f.info_gain;
+  }
 
   m.action = visualization_msgs::msg::Marker::DELETEALL;
   m.id = 0;
@@ -429,7 +458,16 @@ void Explore::visualizeFrontiers(
     if (goalOnBlacklist(frontier.centroid)) {
       m.color = red;
     } else {
-      m.color = blue;
+      // Color gradient based on info_gain: Blue (0) to Green (max)
+      if (max_gain > 0) {
+        double ratio = frontier.info_gain / max_gain;
+        m.color.r = 0;
+        m.color.g = ratio;
+        m.color.b = 1.0 - ratio;
+        m.color.a = 1.0;
+      } else {
+        m.color = blue;
+      }
     }
     markers.push_back(m);
     ++id;
