@@ -35,7 +35,11 @@ FrontierSearch::searchFrom(
   double energy_per_meter,
   double battery_safety_margin,
   double battery_penalty_scale,
-  double min_frontier_clearance)
+  double min_frontier_clearance,
+  const cv::Mat& heatmap,
+  double radiation_scale,
+  double radiation_gradient_scale,
+  const cv::Mat& explored_grid)
 {
   std::vector<Frontier> frontier_list;
 
@@ -103,7 +107,8 @@ FrontierSearch::searchFrom(
   for (auto & frontier : frontier_list) {
     frontier.cost = frontierCost(
       frontier, robot_yaw, battery_state, position, home_pos,
-      energy_per_meter, battery_safety_margin, battery_penalty_scale);
+      energy_per_meter, battery_safety_margin, battery_penalty_scale,
+      heatmap, radiation_scale, radiation_gradient_scale, explored_grid);
   }
   std::sort(
     frontier_list.begin(), frontier_list.end(),
@@ -255,7 +260,11 @@ double FrontierSearch::frontierCost(
   const geometry_msgs::msg::Point & home_pos,
   double energy_per_meter,
   double battery_safety_margin,
-  double battery_penalty_scale)
+  double battery_penalty_scale,
+  const cv::Mat& heatmap,
+  double radiation_scale,
+  double radiation_gradient_scale,
+  const cv::Mat& explored_grid)
 {
   // Feasibility Check
   double dist_to_frontier = frontier.min_distance;
@@ -275,6 +284,67 @@ double FrontierSearch::frontierCost(
   double original_cost = (potential_scale_ * frontier.min_distance *
     costmap_->getResolution()) -
     (gain_scale_ * frontier.size * costmap_->getResolution());
+
+  // Raycasting-based Information Gain (Request 2)
+  double info_gain_cost = 0;
+  if (!explored_grid.empty()) {
+    int unknown_cells_visible = 0;
+    double angle_step = 2.0 * M_PI / 36.0; // 10 degree steps for efficiency
+    double range = 5.0; // Visibility range from frontier
+    double res = costmap_->getResolution();
+
+    for (double a = 0; a < 2.0 * M_PI; a += angle_step) {
+      for (double r = 0; r < range; r += res) {
+        double wx = frontier.centroid.x + r * cos(a);
+        double wy = frontier.centroid.y + r * sin(a);
+        unsigned int rmx, rmy;
+        if (costmap_->worldToMap(wx, wy, rmx, rmy)) {
+          if (costmap_->getCost(rmx, rmy) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+            break;
+          }
+          if (explored_grid.at<uchar>(rmy, rmx) == 0) {
+            unknown_cells_visible++;
+          }
+        } else {
+          break;
+        }
+      }
+    }
+    // Subtract from cost (higher gain = lower cost)
+    info_gain_cost = -gain_scale_ * unknown_cells_visible * res;
+  }
+
+  // Radiation-informed Cost (Request 1)
+  double rad_cost = 0;
+  if (!heatmap.empty()) {
+    unsigned int mx, my;
+    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
+      int h_x = mx;
+      int h_y = my;
+
+      if (h_x >= 0 && h_x < heatmap.cols && h_y >= 0 && h_y < heatmap.rows) {
+        float radiation = heatmap.at<float>(h_y, h_x);
+        rad_cost = radiation_scale * radiation;
+
+        // Gradient (Request 1)
+        if (radiation_gradient_scale != 0 && h_x > 0 && h_x < heatmap.cols - 1 && h_y > 0 && h_y < heatmap.rows - 1) {
+          float grad_x = (heatmap.at<float>(h_y, h_x + 1) - heatmap.at<float>(h_y, h_x - 1)) / 2.0;
+          float grad_y = (heatmap.at<float>(h_y + 1, h_x) - heatmap.at<float>(h_y - 1, h_x)) / 2.0;
+
+          // Vector from robot to frontier
+          double dx = frontier.centroid.x - robot_pos.x;
+          double dy = frontier.centroid.y - robot_pos.y;
+          double d_len = std::sqrt(dx*dx + dy*dy);
+          if (d_len > 0.001) {
+            dx /= d_len;
+            dy /= d_len;
+            // Dot product: preference for moving with/against gradient
+            rad_cost += radiation_gradient_scale * (grad_x * dx + grad_y * dy);
+          }
+        }
+      }
+    }
+  }
 
   // Orientation Cost (Trajectory/Orientation Awareness)
   // Sharply penalize frontiers that are "behind" the robot to prevent backtracking.
@@ -309,6 +379,6 @@ double FrontierSearch::frontierCost(
       battery_penalty = battery_penalty_scale * adjusted_energy_cost;
   }
 
-  return original_cost + orientation_penalty + battery_penalty;
+  return original_cost + info_gain_cost + rad_cost + orientation_penalty + battery_penalty;
 }
 }  // namespace frontier_exploration

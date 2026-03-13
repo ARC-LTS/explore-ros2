@@ -3,6 +3,7 @@
 
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
+#include <opencv2/opencv.hpp>
 
 namespace frontier_exploration
 {
@@ -53,7 +54,11 @@ public:
       double energy_per_meter,
       double battery_safety_margin,
       double battery_penalty_scale,
-      double min_frontier_clearance = 0.0);
+      double min_frontier_clearance = 0.0,
+      const cv::Mat& heatmap = cv::Mat(),
+      double radiation_scale = 0.0,
+      double radiation_gradient_scale = 0.0,
+      const cv::Mat& explored_grid = cv::Mat());
 
 protected:
     /**
@@ -98,7 +103,11 @@ protected:
       const geometry_msgs::msg::Point & home_pos,
       double energy_per_meter,
       double battery_safety_margin,
-      double battery_penalty_scale);
+      double battery_penalty_scale,
+      const cv::Mat& heatmap = cv::Mat(),
+      double radiation_scale = 0.0,
+      double radiation_gradient_scale = 0.0,
+      const cv::Mat& explored_grid = cv::Mat());
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;

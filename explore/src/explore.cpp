@@ -90,7 +90,10 @@ Explore::Explore()
   this->declare_parameter<double>("min_goal_distance_for_replanning", 0.75); // New parameter
   this->declare_parameter<double>("min_battery_percentage", 0.1);
   this->declare_parameter<std::string>("radiation_topic", "rad");
+  this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
+  this->declare_parameter<double>("radiation_scale", 1.0);
+  this->declare_parameter<double>("radiation_gradient_scale", 1.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
   this->declare_parameter<double>("max_battery_used", 0.9);
 
@@ -112,7 +115,10 @@ Explore::Explore()
   this->get_parameter("min_goal_distance_for_replanning", min_goal_distance_for_replanning_); // Get new parameter
   this->get_parameter("min_battery_percentage", min_battery_percentage_);
   this->get_parameter("radiation_topic", radiation_topic_);
+  this->get_parameter("heatmap_topic", heatmap_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
+  this->get_parameter("radiation_scale", radiation_scale_);
+  this->get_parameter("radiation_gradient_scale", radiation_gradient_scale_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
   this->get_parameter("max_battery_used", max_battery_used_);
@@ -156,6 +162,10 @@ Explore::Explore()
     radiation_topic_, 10,
     std::bind(&Explore::radiationCallback, this, std::placeholders::_1));
   last_radiation_update_ = this->now();
+
+  heatmap_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+    heatmap_topic_, 10,
+    std::bind(&Explore::heatmapCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
@@ -294,6 +304,63 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
                 cumulative_dose_, max_radiation_dose_);
     handleExplorationCompletion(true);
   }
+}
+
+void Explore::heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+{
+  try {
+    cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+    latest_heatmap_ = cv_ptr->image;
+  } catch (const cv_bridge::Exception& e) {
+    RCLCPP_ERROR(logger_, "cv_bridge exception in explore node: %s", e.what());
+  }
+}
+
+void Explore::updateExploredArea()
+{
+  nav2_costmap_2d::Costmap2D* costmap = costmap_client_.getCostmap();
+  if (!costmap) return;
+
+  if (explored_grid_.empty() || 
+      explored_grid_.cols != (int)costmap->getSizeInCellsX() || 
+      explored_grid_.rows != (int)costmap->getSizeInCellsY()) 
+  {
+    explored_grid_ = cv::Mat(costmap->getSizeInCellsY(), costmap->getSizeInCellsX(), CV_8UC1, cv::Scalar(0));
+  }
+
+  auto pose = costmap_client_.getRobotPose();
+  unsigned int mx, my;
+  if (!costmap->worldToMap(pose.position.x, pose.position.y, mx, my)) {
+    return;
+  }
+
+  // Simple raycasting to update explored area
+  double angle_step = 2.0 * M_PI / 360.0; // 1 degree steps
+  double range = 10.0; // Max range for exploration measurement
+  double res = costmap->getResolution();
+
+  for (double a = 0; a < 2.0 * M_PI; a += angle_step) {
+    for (double r = 0; r < range; r += res) {
+      double wx = pose.position.x + r * cos(a);
+      double wy = pose.position.y + r * sin(a);
+      unsigned int rmx, rmy;
+      if (costmap->worldToMap(wx, wy, rmx, rmy)) {
+        if (costmap->getCost(rmx, rmy) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+          explored_grid_.at<uchar>(rmy, rmx) = 255;
+          break; // Hit obstacle
+        }
+        explored_grid_.at<uchar>(rmy, rmx) = 255;
+      } else {
+        break; // Out of map
+      }
+    }
+  }
+
+  // Calculate and log explored area
+  int explored_count = cv::countNonZero(explored_grid_);
+  double area = explored_count * res * res;
+  RCLCPP_INFO_THROTTLE(logger_, *this->get_clock(), 5000, 
+                       "Explored Area: %.2f m^2 (%d cells)", area, explored_count);
 }
 
 void Explore::visualizeFrontiers(
@@ -436,6 +503,7 @@ void Explore::makePlan()
   }
 
   // --- Stage 2: Find the best new frontier ---
+  updateExploredArea();
   auto pose = costmap_client_.getRobotPose();
   double robot_yaw = tf2::getYaw(pose.orientation);
   double search_yaw = robot_yaw;
@@ -447,7 +515,8 @@ void Explore::makePlan()
     pose.position, search_yaw, latest_battery_state_,
     initial_pose_.position, energy_per_meter_,
     battery_safety_margin_, battery_penalty_scale_,
-    min_frontier_clearance_);
+    min_frontier_clearance_, latest_heatmap_, 
+    radiation_scale_, radiation_gradient_scale_, explored_grid_);
 
   RCLCPP_INFO(logger_, "Status: Explored %d frontiers, %lu currently available.", 
               frontiers_explored_count_, frontiers.size());

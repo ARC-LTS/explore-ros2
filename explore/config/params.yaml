@@ -20,5 +20,9 @@
     battery_penalty_scale: 1.0
     max_battery_used: 0.8
     max_radiation_dose: 100.0
+    radiation_topic: rad
+    heatmap_topic: /rad_heatmap/raw_mean_map
+    radiation_scale: 1.0
+    radiation_gradient_scale: 1.0
     max_verification_attempts: 5
     min_goal_distance_for_replanning: 0.75

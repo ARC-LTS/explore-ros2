@@ -57,7 +57,10 @@
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -138,6 +141,9 @@ private:
     rclcpp::Subscription < std_msgs::msg::Float64MultiArray > ::SharedPtr radiation_sub_;
     void radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
 
+    rclcpp::Subscription < sensor_msgs::msg::Image > ::SharedPtr heatmap_sub_;
+    void heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
     double prev_distance_;
@@ -202,7 +208,15 @@ private:
 
     // radiation parameters
     std::string radiation_topic_;
+    std::string heatmap_topic_;
     double max_radiation_dose_;
+    double radiation_scale_;
+    double radiation_gradient_scale_;
+    cv::Mat latest_heatmap_;
+
+    // Explored area tracking
+    cv::Mat explored_grid_;
+    void updateExploredArea();
 
     // verification parameters
     int max_verification_attempts_;
