@@ -214,6 +214,8 @@ private:
     double max_radiation_dose_;
     double radiation_scale_;
     double radiation_gradient_scale_;
+    double critical_dose_mrem_hr_;
+    double current_radiation_rate_ = 0.0;
     cv::Mat latest_heatmap_;
 
     // Explored area tracking

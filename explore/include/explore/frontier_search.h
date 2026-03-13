@@ -56,10 +56,10 @@ public:
       double battery_safety_margin,
       double battery_penalty_scale,
       double min_frontier_clearance = 0.0,
-      const cv::Mat& heatmap = cv::Mat(),
+      const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
-      const cv::Mat& explored_grid = cv::Mat());
+      const cv::Mat & explored_grid = cv::Mat());
 
 protected:
     /**
@@ -105,10 +105,10 @@ protected:
       double energy_per_meter,
       double battery_safety_margin,
       double battery_penalty_scale,
-      const cv::Mat& heatmap = cv::Mat(),
+      const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
-      const cv::Mat& explored_grid = cv::Mat());
+      const cv::Mat & explored_grid = cv::Mat());
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;

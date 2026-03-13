@@ -92,6 +92,7 @@ Explore::Explore()
   this->declare_parameter<std::string>("radiation_topic", "rad");
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
+  this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
   this->declare_parameter<double>("radiation_scale", 1.0);
   this->declare_parameter<double>("radiation_gradient_scale", 1.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
@@ -117,6 +118,7 @@ Explore::Explore()
   this->get_parameter("radiation_topic", radiation_topic_);
   this->get_parameter("heatmap_topic", heatmap_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
+  this->get_parameter("critical_dose_mrem_hr", critical_dose_mrem_hr_);
   this->get_parameter("radiation_scale", radiation_scale_);
   this->get_parameter("radiation_gradient_scale", radiation_gradient_scale_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
@@ -280,11 +282,13 @@ void Explore::batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr ms
 
   if (!exploration_finished_ && (battery_low || battery_used_up)) {
     if (battery_low) {
-        RCLCPP_WARN(logger_, "Battery level %.2f below threshold %.2f. Returning to origin.", 
-                    latest_battery_state_.percentage, min_battery_percentage_);
+      RCLCPP_WARN(
+        logger_, "Battery level %.2f below threshold %.2f. Returning to origin.",
+        latest_battery_state_.percentage, min_battery_percentage_);
     } else {
-        RCLCPP_WARN(logger_, "Battery used %.2f exceeds threshold %.2f. Returning to origin.", 
-                    1.0 - latest_battery_state_.percentage, max_battery_used_);
+      RCLCPP_WARN(
+        logger_, "Battery used %.2f exceeds threshold %.2f. Returning to origin.",
+        1.0 - latest_battery_state_.percentage, max_battery_used_);
     }
     handleExplorationCompletion(true);
   }
@@ -292,9 +296,10 @@ void Explore::batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr ms
 
 void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
 {
-  if (msg->data.size() < 2) return;
-  
+  if (msg->data.size() < 2) {return;}
+
   double mR_hr = msg->data[1];
+  current_radiation_rate_ = mR_hr; // Store current rate
   rclcpp::Time now = this->now();
   double dt = (now - last_radiation_update_).seconds();
   last_radiation_update_ = now;
@@ -305,8 +310,9 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
   }
 
   if (!exploration_finished_ && cumulative_dose_ > max_radiation_dose_) {
-    RCLCPP_WARN(logger_, "Cumulative radiation dose %.2f mR exceeded threshold %.2f mR. Returning to origin.", 
-                cumulative_dose_, max_radiation_dose_);
+    RCLCPP_WARN(
+      logger_, "Cumulative radiation dose %.2f mR exceeded threshold %.2f mR. Returning to origin.",
+      cumulative_dose_, max_radiation_dose_);
     handleExplorationCompletion(true);
   }
 }
@@ -314,23 +320,26 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
 void Explore::heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
   try {
-    cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+    cv_bridge::CvImagePtr cv_ptr =
+      cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
     latest_heatmap_ = cv_ptr->image;
-  } catch (const cv_bridge::Exception& e) {
+  } catch (const cv_bridge::Exception & e) {
     RCLCPP_ERROR(logger_, "cv_bridge exception in explore node: %s", e.what());
   }
 }
 
 void Explore::updateExploredArea()
 {
-  nav2_costmap_2d::Costmap2D* costmap = costmap_client_.getCostmap();
-  if (!costmap) return;
+  nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
+  if (!costmap) {return;}
 
-  if (explored_grid_.empty() || 
-      explored_grid_.cols != (int)costmap->getSizeInCellsX() || 
-      explored_grid_.rows != (int)costmap->getSizeInCellsY()) 
+  if (explored_grid_.empty() ||
+    explored_grid_.cols != (int)costmap->getSizeInCellsX() ||
+    explored_grid_.rows != (int)costmap->getSizeInCellsY())
   {
-    explored_grid_ = cv::Mat(costmap->getSizeInCellsY(), costmap->getSizeInCellsX(), CV_8UC1, cv::Scalar(0));
+    explored_grid_ = cv::Mat(
+      costmap->getSizeInCellsY(),
+      costmap->getSizeInCellsX(), CV_8UC1, cv::Scalar(0));
   }
 
   auto pose = costmap_client_.getRobotPose();
@@ -364,8 +373,9 @@ void Explore::updateExploredArea()
   // Calculate and log explored area
   int explored_count = cv::countNonZero(explored_grid_);
   double area = explored_count * res * res;
-  RCLCPP_INFO_THROTTLE(logger_, *this->get_clock(), 5000, 
-                       "Explored Area: %.2f m^2 (%d cells)", area, explored_count);
+  RCLCPP_INFO_THROTTLE(
+    logger_, *this->get_clock(), 5000,
+    "Explored Area: %.2f m^2 (%d cells)", area, explored_count);
 
   // Publish the explored area map for visualization
   if (visualize_ && explored_area_publisher_) {
@@ -437,8 +447,8 @@ void Explore::visualizeFrontiers(
   // weighted frontiers are always sorted
   double min_cost = frontiers.empty() ? 0. : frontiers.front().cost;
   double max_gain = 0.0;
-  for (const auto& f : frontiers) {
-    if (f.info_gain > max_gain) max_gain = f.info_gain;
+  for (const auto & f : frontiers) {
+    if (f.info_gain > max_gain) {max_gain = f.info_gain;}
   }
 
   m.action = visualization_msgs::msg::Marker::DELETEALL;
@@ -502,41 +512,66 @@ void Explore::makePlan()
     return;
   }
 
+  // --- Stage 0: Danger Check (Radiation) ---
+  // If we are in a critical radiation zone, STOP exploration and let recovery handle it.
+  if (current_radiation_rate_ > critical_dose_mrem_hr_) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *this->get_clock(), 5000,
+      "Robot in CRITICAL radiation zone (%.2f mR/hr). Suspending frontier navigation.",
+      current_radiation_rate_);
+    if (goal_active_) {
+      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      goal_active_ = false;
+    }
+    return;
+  }
+
   // --- Stage 1: Check current navigation goal status ---
   if (goal_active_ || waiting_for_goal_response_) {
     bool should_cancel_current_goal = false;
 
     // Check for timeout (only if goal is active, not just waiting for response)
     if (goal_active_ && (this->now() - last_progress_) > tf2::durationFromSec(progress_timeout_)) {
-      RCLCPP_WARN(logger_, "Active navigation goal has timed out after %.2f seconds. Cancelling current goal and re-planning.", progress_timeout_);
+      RCLCPP_WARN(
+        logger_,
+        "Active navigation goal has timed out after %.2f seconds. Cancelling current goal and re-planning.",
+        progress_timeout_);
       should_cancel_current_goal = true;
     } else if (goal_active_) { // If active and not timed out, check traversability
       nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
       unsigned int mx, my;
       if (costmap->worldToMap(last_sent_goal_position_.x, last_sent_goal_position_.y, mx, my)) {
         unsigned char cost = costmap->getCost(mx, my);
-        // Use LETHAL_OBSTACLE (254) as hard limit.
-        if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
-          RCLCPP_INFO(logger_, "Current navigation goal (%.2f, %.2f) is now blocked (cost: %d). Cancelling and blacklisting.", last_sent_goal_position_.x, last_sent_goal_position_.y, cost);
+        // Use INSCRIBED_INFLATED_OBSTACLE (253) as hard limit for robot center traversability.
+        if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+          RCLCPP_INFO(
+            logger_,
+            "Current navigation goal (%.2f, %.2f) is now blocked (cost: %d). Cancelling and blacklisting.", last_sent_goal_position_.x, last_sent_goal_position_.y,
+            cost);
           frontier_blacklist_.push_back(last_sent_goal_position_);
           should_cancel_current_goal = true;
         }
       } else { // Goal outside map, potentially invalid, treat as blocked.
-          RCLCPP_WARN(logger_, "Current navigation goal (%.2f, %.2f) is outside map bounds. Cancelling and blacklisting.", last_sent_goal_position_.x, last_sent_goal_position_.y);
-          frontier_blacklist_.push_back(last_sent_goal_position_);
-          should_cancel_current_goal = true;
+        RCLCPP_WARN(
+          logger_,
+          "Current navigation goal (%.2f, %.2f) is outside map bounds. Cancelling and blacklisting.", last_sent_goal_position_.x,
+          last_sent_goal_position_.y);
+        frontier_blacklist_.push_back(last_sent_goal_position_);
+        should_cancel_current_goal = true;
       }
     }
 
     if (should_cancel_current_goal) {
-        if (navigation_goal_handle_) {
-            move_base_client_->async_cancel_goal(navigation_goal_handle_);
-        }
-        // Goal state will be reset in resultCallback.
-        // Allow to continue to find a new goal.
+      if (navigation_goal_handle_) {
+        move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      }
+      // Goal state will be reset in resultCallback.
+      // Allow to continue to find a new goal.
     } else { // Goal is still active/waiting and not cancelled.
-        RCLCPP_DEBUG(logger_, "Current navigation goal still active or waiting response. Deferring new plan generation.");
-        return; // Stick to the current goal.
+      RCLCPP_DEBUG(
+        logger_,
+        "Current navigation goal still active or waiting response. Deferring new plan generation.");
+      return;   // Stick to the current goal.
     }
   }
 
@@ -553,11 +588,12 @@ void Explore::makePlan()
     pose.position, search_yaw, latest_battery_state_,
     initial_pose_.position, energy_per_meter_,
     battery_safety_margin_, battery_penalty_scale_,
-    min_frontier_clearance_, latest_heatmap_, 
+    min_frontier_clearance_, latest_heatmap_,
     radiation_scale_, radiation_gradient_scale_, explored_grid_);
 
-  RCLCPP_INFO(logger_, "Status: Explored %d frontiers, %lu currently available.", 
-              frontiers_explored_count_, frontiers.size());
+  RCLCPP_INFO(
+    logger_, "Status: Explored %d frontiers, %lu currently available.",
+    frontiers_explored_count_, frontiers.size());
   if (visualize_) {
     visualizeFrontiers(frontiers);
   }
@@ -565,14 +601,16 @@ void Explore::makePlan()
   // --- Stage 3: Select a valid frontier ---
   auto frontier = std::find_if_not(
     frontiers.begin(), frontiers.end(),
-    [this, &pose](const frontier_exploration::Frontier& f) {
+    [this, &pose](const frontier_exploration::Frontier & f) {
       if (goalOnBlacklist(f.centroid)) {
         return true;
       }
       double dx = f.centroid.x - pose.position.x;
       double dy = f.centroid.y - pose.position.y;
       if (dx * dx + dy * dy < 0.75 * 0.75) {
-        RCLCPP_DEBUG(logger_, "Skipping frontier at (%.2f, %.2f) - too close to robot", f.centroid.x, f.centroid.y);
+        RCLCPP_DEBUG(
+          logger_, "Skipping frontier at (%.2f, %.2f) - too close to robot",
+          f.centroid.x, f.centroid.y);
         return true;
       }
       return false;
@@ -582,12 +620,16 @@ void Explore::makePlan()
   if (frontiers.empty() || frontier == frontiers.end()) {
     no_frontier_count_++;
     if (no_frontier_count_ >= no_frontier_retry_) {
-      RCLCPP_WARN(logger_, "No valid frontiers found after %d retries. Explored %d frontiers. Starting verification phase.", 
-                  no_frontier_count_, frontiers_explored_count_);
+      RCLCPP_WARN(
+        logger_,
+        "No valid frontiers found after %d retries. Explored %d frontiers. Starting verification phase.",
+        no_frontier_count_, frontiers_explored_count_);
       no_frontier_count_ = 0;
       startVerification();
     } else {
-      RCLCPP_INFO(logger_, "No valid frontiers found, retry %d/%d", no_frontier_count_, no_frontier_retry_);
+      RCLCPP_INFO(
+        logger_, "No valid frontiers found, retry %d/%d", no_frontier_count_,
+        no_frontier_retry_);
     }
     return;
   }
@@ -595,11 +637,13 @@ void Explore::makePlan()
   // Frontiers found, reset verification state
   is_verifying_ = false;
   verification_attempts_ = 0;
-  
+
   geometry_msgs::msg::Point target_position = frontier->middle;
 
   // --- Stage 5: Send the new navigation goal ---
-  RCLCPP_INFO(logger_, "Sending new navigation goal to (%.2f, %.2f).", target_position.x, target_position.y);
+  RCLCPP_INFO(
+    logger_, "Sending new navigation goal to (%.2f, %.2f).", target_position.x,
+    target_position.y);
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = target_position;
   double yaw = atan2(target_position.y - pose.position.y, target_position.x - pose.position.x);
@@ -609,10 +653,12 @@ void Explore::makePlan()
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
-  auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  auto send_goal_options =
+    rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
   send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
   send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
-  send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, target_position);
+  send_goal_options.result_callback =
+    std::bind(&Explore::resultCallback, this, _1, target_position);
 
   waiting_for_goal_response_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
@@ -654,24 +700,30 @@ void Explore::handleExplorationCompletion(bool force_return)
 void Explore::startVerification()
 {
   if (verification_attempts_ >= max_verification_attempts_) {
-    RCLCPP_WARN(logger_, "Verification phase complete after %d attempts. No new frontiers found. Believing completion.", 
-                verification_attempts_);
+    RCLCPP_WARN(
+      logger_,
+      "Verification phase complete after %d attempts. No new frontiers found. Believing completion.",
+      verification_attempts_);
     handleExplorationCompletion(true);
     return;
   }
 
   is_verifying_ = true;
   verification_attempts_++;
-  
-  RCLCPP_INFO(logger_, "Starting verification attempt %d/%d to ensure no regions were missed. Explored %d frontiers so far.", 
-              verification_attempts_, max_verification_attempts_, frontiers_explored_count_);
+
+  RCLCPP_INFO(
+    logger_,
+    "Starting verification attempt %d/%d to ensure no regions were missed. Explored %d frontiers so far.",
+    verification_attempts_, max_verification_attempts_, frontiers_explored_count_);
 
   auto pose = costmap_client_.getRobotPose();
   geometry_msgs::msg::Point verification_goal;
   bool found_goal = false;
-  
+
   // Systematically check different directions (N, S, E, W, NE, NW, SE, SW)
-  double angles[] = {0.0, M_PI, M_PI / 2.0, -M_PI / 2.0, M_PI / 4.0, 3.0 * M_PI / 4.0, -M_PI / 4.0, -3.0 * M_PI / 4.0};
+  double angles[] =
+  {0.0, M_PI, M_PI / 2.0, -M_PI / 2.0, M_PI / 4.0, 3.0 * M_PI / 4.0, -M_PI / 4.0,
+    -3.0 * M_PI / 4.0};
   int start_angle_idx = (verification_attempts_ - 1) % 8;
   double search_distance = 4.0 + 4.0 * ((verification_attempts_ - 1) / 2); // Increase distance every 2 attempts
 
@@ -682,7 +734,10 @@ void Explore::startVerification()
     verification_goal.y = pose.position.y + search_distance * sin(angle);
 
     unsigned int mx, my;
-    if (costmap_client_.getCostmap()->worldToMap(verification_goal.x, verification_goal.y, mx, my)) {
+    if (costmap_client_.getCostmap()->worldToMap(
+        verification_goal.x, verification_goal.y, mx,
+        my))
+    {
       unsigned char cost = costmap_client_.getCostmap()->getCost(mx, my);
       if (cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
         found_goal = true;
@@ -692,28 +747,35 @@ void Explore::startVerification()
   }
 
   if (found_goal) {
-    RCLCPP_INFO(logger_, "Verification: Traversing to region at (%.2f, %.2f) to check for missing frontiers.", 
-                verification_goal.x, verification_goal.y);
+    RCLCPP_INFO(
+      logger_, "Verification: Traversing to region at (%.2f, %.2f) to check for missing frontiers.",
+      verification_goal.x, verification_goal.y);
     auto goal = nav2_msgs::action::NavigateToPose::Goal();
     goal.pose.pose.position = verification_goal;
     goal.pose.pose.orientation = pose.orientation;
     goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
     goal.pose.header.stamp = this->now();
 
-    auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-    send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, verification_goal);
+    auto send_goal_options =
+      rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+    send_goal_options.result_callback = std::bind(
+      &Explore::resultCallback, this, _1,
+      verification_goal);
     send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
     send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
 
     waiting_for_goal_response_ = true;
     move_base_client_->async_send_goal(goal, send_goal_options);
-    
+
     last_sent_goal_position_ = verification_goal;
     goal_start_pose_ = pose;
     last_progress_ = this->now();
     prev_distance_ = std::numeric_limits<double>::infinity();
   } else {
-    RCLCPP_WARN(logger_, "Verification: Could not find a valid goal in attempt %d. Trying next attempt.", verification_attempts_);
+    RCLCPP_WARN(
+      logger_,
+      "Verification: Could not find a valid goal in attempt %d. Trying next attempt.",
+      verification_attempts_);
     startVerification(); // Recursive call to next attempt
   }
 }
@@ -784,7 +846,9 @@ void Explore::feedbackCallback(
   }
 
   if (feedback->number_of_recoveries > last_recovery_count_) {
-    RCLCPP_INFO(logger_, "Nav2 recovery behavior detected (count: %d). Resetting progress timeout.", feedback->number_of_recoveries);
+    RCLCPP_INFO(
+      logger_, "Nav2 recovery behavior detected (count: %d). Resetting progress timeout.",
+      feedback->number_of_recoveries);
     last_progress_ = this->now();
     last_recovery_count_ = feedback->number_of_recoveries;
   }
@@ -814,7 +878,9 @@ void Explore::resultCallback(
 
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      RCLCPP_INFO(logger_, "Navigation goal to (%.2f, %.2f) SUCCEEDED.", frontier_goal.x, frontier_goal.y);
+      RCLCPP_INFO(
+        logger_, "Navigation goal to (%.2f, %.2f) SUCCEEDED.", frontier_goal.x,
+        frontier_goal.y);
       last_goal_successful_ = true;
       if (!is_verifying_) {
         frontiers_explored_count_++;
@@ -822,25 +888,32 @@ void Explore::resultCallback(
       break;
     case rclcpp_action::ResultCode::ABORTED:
       if (waiting_for_goal_response_) {
-        RCLCPP_INFO(logger_, "Navigation goal to (%.2f, %.2f) PREEMPTED by new goal. Not blacklisting.", frontier_goal.x, frontier_goal.y);
+        RCLCPP_INFO(
+          logger_,
+          "Navigation goal to (%.2f, %.2f) PREEMPTED by new goal. Not blacklisting.",
+          frontier_goal.x, frontier_goal.y);
       } else {
-        RCLCPP_WARN(logger_, "Navigation goal to (%.2f, %.2f) ABORTED. Adding to blacklist.", frontier_goal.x, frontier_goal.y);
+        RCLCPP_WARN(
+          logger_, "Navigation goal to (%.2f, %.2f) ABORTED. Adding to blacklist.",
+          frontier_goal.x, frontier_goal.y);
         frontier_blacklist_.push_back(frontier_goal);
       }
       last_goal_successful_ = false;
       break;
     case rclcpp_action::ResultCode::CANCELED:
-      RCLCPP_INFO(logger_, "Navigation goal to (%.2f, %.2f) CANCELED.", frontier_goal.x, frontier_goal.y);
+      RCLCPP_INFO(
+        logger_, "Navigation goal to (%.2f, %.2f) CANCELED.", frontier_goal.x,
+        frontier_goal.y);
       last_goal_successful_ = false;
       break;
     default:
       RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
       break;
   }
-  
+
   // Only trigger a new plan if we aren't already waiting for one or if one hasn't been preemptively sent.
   if (!waiting_for_goal_response_) {
-      makePlan();
+    makePlan();
   }
 }
 

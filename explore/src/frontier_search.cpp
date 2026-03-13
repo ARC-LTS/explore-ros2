@@ -36,10 +36,10 @@ FrontierSearch::searchFrom(
   double battery_safety_margin,
   double battery_penalty_scale,
   double min_frontier_clearance,
-  const cv::Mat& heatmap,
+  const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
-  const cv::Mat& explored_grid)
+  const cv::Mat & explored_grid)
 {
   std::vector<Frontier> frontier_list;
 
@@ -75,7 +75,9 @@ FrontierSearch::searchFrom(
     bfs.push(clear);
   } else {
     bfs.push(pos);
-    RCLCPP_WARN(logger_, "[FrontierSearch] Could not find traversable cell to start search from robot position");
+    RCLCPP_WARN(
+      logger_,
+      "[FrontierSearch] Could not find traversable cell to start search from robot position");
   }
   visited_flag[bfs.front()] = true;
 
@@ -86,7 +88,7 @@ FrontierSearch::searchFrom(
     // iterate over 4-connected neighbourhood
     for (unsigned nbr : nhood4(idx, *costmap_)) {
       // add to queue all free, unvisited cells
-      if (map_[nbr] < LETHAL_OBSTACLE && !visited_flag[nbr]) {
+      if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE && !visited_flag[nbr]) {
         visited_flag[nbr] = true;
         bfs.push(nbr);
         // check if cell is new frontier cell (unvisited, NO_INFORMATION, free
@@ -236,16 +238,16 @@ bool FrontierSearch::isNewFrontierCell(
   // frontier cells should have at least one cell in 4-connected neighbourhood
   // that is free and has enough clearance
   for (unsigned int nbr : nhood4(idx, *costmap_)) {
-    if (map_[nbr] < LETHAL_OBSTACLE) {
-        if (min_frontier_clearance <= 0) {
-            return true;
-        }
-        // If clearance is requested, we check if the neighbor's cost is low enough.
-        // A cost of 0 (FREE_SPACE) is the safest.
-        // As a heuristic, we'll use a threshold of 100 to ensure some distance from obstacles while being more tolerant.
-        if (map_[nbr] < 100) {
-            return true;
-        }
+    if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+      if (min_frontier_clearance <= 0) {
+        return true;
+      }
+      // If clearance is requested, we check if the neighbor's cost is low enough.
+      // A cost of 0 (FREE_SPACE) is the safest.
+      // As a heuristic, we'll use a threshold of 100 to ensure some distance from obstacles while being more tolerant.
+      if (map_[nbr] < 128) {
+        return true;
+      }
     }
   }
 
@@ -261,10 +263,10 @@ double FrontierSearch::frontierCost(
   double energy_per_meter,
   double battery_safety_margin,
   double battery_penalty_scale,
-  const cv::Mat& heatmap,
+  const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
-  const cv::Mat& explored_grid)
+  const cv::Mat & explored_grid)
 {
   frontier.info_gain = 0.0;
   // Feasibility Check
@@ -282,8 +284,8 @@ double FrontierSearch::frontierCost(
   }
 
   // Original Cost
-  double original_cost = (potential_scale_ * frontier.min_distance *
-    costmap_->getResolution()) -
+  // min_distance is already in meters, removed resolution multiplication.
+  double original_cost = (potential_scale_ * frontier.min_distance) -
     (gain_scale_ * frontier.size * costmap_->getResolution());
 
   // Raycasting-based Information Gain (Request 2)
@@ -326,18 +328,31 @@ double FrontierSearch::frontierCost(
       int h_y = my;
 
       if (h_x >= 0 && h_x < heatmap.cols && h_y >= 0 && h_y < heatmap.rows) {
-        float radiation = heatmap.at<float>(h_y, h_x);
-        rad_cost = radiation_scale * radiation;
+        // Map h_y (bottom-up) to row index (top-down)
+        int row = (heatmap.rows - 1) - h_y;
+        float radiation = heatmap.at<float>(row, h_x);
+
+        // Non-linear aggressive penalty (Request 1 refinement)
+        // If radiation is high, the penalty should grow faster than the gain can offset.
+        // Using a squared penalty after a warning threshold.
+        double warning_thresh = 0.25; // Physical threshold for "elevated"
+        if (radiation > warning_thresh) {
+          rad_cost = radiation_scale * std::pow(radiation / warning_thresh, 2.0);
+        } else {
+          rad_cost = radiation_scale * radiation;
+        }
 
         // Gradient (Request 1)
-        if (radiation_gradient_scale != 0 && h_x > 0 && h_x < heatmap.cols - 1 && h_y > 0 && h_y < heatmap.rows - 1) {
+        if (radiation_gradient_scale != 0 && h_x > 0 && h_x < heatmap.cols - 1 && h_y > 0 &&
+          h_y < heatmap.rows - 1)
+        {
           float grad_x = (heatmap.at<float>(h_y, h_x + 1) - heatmap.at<float>(h_y, h_x - 1)) / 2.0;
           float grad_y = (heatmap.at<float>(h_y + 1, h_x) - heatmap.at<float>(h_y - 1, h_x)) / 2.0;
 
           // Vector from robot to frontier
           double dx = frontier.centroid.x - robot_pos.x;
           double dy = frontier.centroid.y - robot_pos.y;
-          double d_len = std::sqrt(dx*dx + dy*dy);
+          double d_len = std::sqrt(dx * dx + dy * dy);
           if (d_len > 0.001) {
             dx /= d_len;
             dy /= d_len;
@@ -363,12 +378,12 @@ double FrontierSearch::frontierCost(
   double orientation_penalty = 0;
   if (orientation_scale_ > 0) {
     if (angle_diff > M_PI / 3.0) { // > 60 degrees
-        // Quadratic penalty: grows quickly as we look further behind
-        double normalized_diff = angle_diff / (M_PI / 3.0);
-        orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
+      // Quadratic penalty: grows quickly as we look further behind
+      double normalized_diff = angle_diff / (M_PI / 3.0);
+      orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
     } else {
-        // Light linear penalty for small deviations
-        orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
+      // Light linear penalty for small deviations
+      orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
     }
   }
 
@@ -376,10 +391,11 @@ double FrontierSearch::frontierCost(
   // Only apply a strong penalty if battery is significantly depleted or if we are very far from home.
   double battery_penalty = 0;
   if (battery_penalty_scale > 0) {
-      // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
-      double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
-      double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) * energy_per_meter;
-      battery_penalty = battery_penalty_scale * adjusted_energy_cost;
+    // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
+    double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
+    double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) *
+      energy_per_meter;
+    battery_penalty = battery_penalty_scale * adjusted_energy_cost;
   }
 
   return original_cost + info_gain_cost + rad_cost + orientation_penalty + battery_penalty;
