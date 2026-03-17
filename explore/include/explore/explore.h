@@ -197,8 +197,12 @@ private:
 
     // Added for more robust goal management
     geometry_msgs::msg::Point last_sent_goal_position_;
+    geometry_msgs::msg::Point queued_target_;
+    bool has_queued_target_ = false;
     bool last_goal_successful_ = false;
     double min_goal_distance_for_replanning_;
+
+    void sendGoal(const geometry_msgs::msg::Point & target);
 
     // battery-aware parameters
     std::string battery_topic_;

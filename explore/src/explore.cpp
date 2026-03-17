@@ -320,6 +320,7 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
       frontier_blacklist_.push_back(last_sent_goal_position_);
     }
     is_recovering_ = true;
+    has_queued_target_ = false;
   }
 
   if (!exploration_finished_ && cumulative_dose_ > max_radiation_dose_) {
@@ -570,16 +571,26 @@ void Explore::makePlan()
       RCLCPP_WARN(logger_, "Active goal timed out. Re-planning.");
       is_current_goal_invalid = true;
     }
-    // 2. Check if current goal is now blocked
+    // 2. Check if current goal is now blocked OR already explored (no longer unknown)
     nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
     unsigned int mx, my;
     if (costmap->worldToMap(last_sent_goal_position_.x, last_sent_goal_position_.y, mx, my)) {
       unsigned char cost = costmap->getCost(mx, my);
+      // If it's an obstacle (>= 253) OR if it's already been explored (not NO_INFORMATION/255)
       if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-        RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting and re-planning.");
+        RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting.");
         frontier_blacklist_.push_back(last_sent_goal_position_);
         is_current_goal_invalid = true;
+      } else if (cost != nav2_costmap_2d::NO_INFORMATION) {
+        RCLCPP_INFO(logger_, "Current goal area already explored by sensors. Switching targets.");
+        is_current_goal_invalid = true;
       }
+    }
+
+    if (is_current_goal_invalid) {
+      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      goal_active_ = false;
+      // We fall through to allow the search to immediately find a replacement.
     }
   }
 
@@ -604,11 +615,13 @@ void Explore::makePlan()
     visualizeFrontiers(frontiers);
   }
 
-  // Stage 3: Select valid frontier
+  // Filter frontiers: find the best one that isn't the one we are currently pursuing
   auto frontier_it = std::find_if_not(
     frontiers.begin(), frontiers.end(),
     [this, &pose](const frontier_exploration::Frontier & f) {
       if (goalOnBlacklist(f.centroid)) return true;
+      // If we already have an active goal, don't pick the same one as the current target
+      if (goal_active_ && same_point(f.centroid, last_sent_goal_position_)) return true;
       // Distance check
       double dx = f.centroid.x - pose.position.x;
       double dy = f.centroid.y - pose.position.y;
@@ -625,30 +638,38 @@ void Explore::makePlan()
         startVerification();
       }
     }
+    has_queued_target_ = false;
     return;
   }
 
-  geometry_msgs::msg::Point new_target = findSafeViewpoint(*frontier_it);
+  geometry_msgs::msg::Point best_target = findSafeViewpoint(*frontier_it);
 
-  // Opportunistic Preemption Check
-  if (goal_active_ && !is_current_goal_invalid) {
-    double dx = new_target.x - last_sent_goal_position_.x;
-    double dy = new_target.y - last_sent_goal_position_.y;
-    double dist_to_new = sqrt(dx * dx + dy * dy);
-
-    // If the new target is far from the old one, it means our current target
-    // was likely explored/consumed or a much better one appeared.
-    if (dist_to_new < min_goal_distance_for_replanning_) {
-      return; // Stick to current goal
-    }
-    RCLCPP_INFO(logger_, "Found significantly better frontier. Preempting current goal.");
+  // If a goal is active and valid, we just queue the next target.
+  if (goal_active_) {
+    queued_target_ = best_target;
+    has_queued_target_ = true;
+    RCLCPP_DEBUG(logger_, "Queued next target (%.2f, %.2f) while moving.", best_target.x, best_target.y);
+    return; 
   }
 
-  // --- Stage 5: Send the goal ---
-  RCLCPP_INFO(logger_, "Sending navigation goal to (%.2f, %.2f).", new_target.x, new_target.y);
+  // If we get here, no goal is active (or it was just invalidated).
+  // Check the queue first for zero-delay transition, otherwise use the best target found.
+  if (has_queued_target_ && !goalOnBlacklist(queued_target_)) {
+    sendGoal(queued_target_);
+    has_queued_target_ = false;
+  } else {
+    sendGoal(best_target);
+  }
+}
+
+void Explore::sendGoal(const geometry_msgs::msg::Point & target)
+{
+  auto pose = costmap_client_.getRobotPose();
+  RCLCPP_INFO(logger_, "Sending navigation goal to (%.2f, %.2f).", target.x, target.y);
+  
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = new_target;
-  double yaw = atan2(new_target.y - pose.position.y, new_target.x - pose.position.x);
+  goal.pose.pose.position = target;
+  double yaw = atan2(target.y - pose.position.y, target.x - pose.position.x);
   tf2::Quaternion q;
   q.setRPY(0, 0, yaw);
   goal.pose.pose.orientation = tf2::toMsg(q);
@@ -658,18 +679,17 @@ void Explore::makePlan()
   auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
   send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
   send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
-  send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, new_target);
+  send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, target);
 
   waiting_for_goal_response_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
 
-  last_sent_goal_position_ = new_target;
+  last_sent_goal_position_ = target;
   goal_start_pose_ = pose;
   last_progress_ = this->now();
   prev_distance_ = std::numeric_limits<double>::infinity();
   no_frontier_count_ = 0;
   last_goal_successful_ = false;
-}
 }
 
 void Explore::handleExplorationCompletion(bool force_return)
