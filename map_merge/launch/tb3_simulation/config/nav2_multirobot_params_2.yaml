@@ -153,7 +153,7 @@ controller_server:
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      BaseObstacle.scale: 5.0
       PathAlign.scale: 0.0
       GoalAlign.scale: 0.0
       PathDist.scale: 32.0
@@ -242,10 +242,15 @@ planner_server:
     use_sim_time: True
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
+      plugin: "nav2_smac_planner/SmacPlanner2D"
       tolerance: 0.5
-      use_astar: false
       allow_unknown: true
+      downsample_costmap: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      cost_penalty: 3.0
+      retrospective_penalty: 0.015
 
 planner_server_rclcpp_node:
   ros__parameters:

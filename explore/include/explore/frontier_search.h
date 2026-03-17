@@ -59,6 +59,7 @@ public:
       const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
+      double critical_dose_mrem_hr = 2.0,
       const cv::Mat & explored_grid = cv::Mat());
 
 protected:
@@ -108,6 +109,7 @@ protected:
       const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
+      double critical_dose_mrem_hr = 2.0,
       const cv::Mat & explored_grid = cv::Mat());
 
 private:

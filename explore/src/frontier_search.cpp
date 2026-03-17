@@ -39,6 +39,7 @@ FrontierSearch::searchFrom(
   const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
+  double critical_dose_mrem_hr,
   const cv::Mat & explored_grid)
 {
   std::vector<Frontier> frontier_list;
@@ -110,7 +111,8 @@ FrontierSearch::searchFrom(
     frontier.cost = frontierCost(
       frontier, robot_yaw, battery_state, position, home_pos,
       energy_per_meter, battery_safety_margin, battery_penalty_scale,
-      heatmap, radiation_scale, radiation_gradient_scale, explored_grid);
+      heatmap, radiation_scale, radiation_gradient_scale, 
+      critical_dose_mrem_hr, explored_grid);
   }
   std::sort(
     frontier_list.begin(), frontier_list.end(),
@@ -244,8 +246,8 @@ bool FrontierSearch::isNewFrontierCell(
       }
       // If clearance is requested, we check if the neighbor's cost is low enough.
       // A cost of 0 (FREE_SPACE) is the safest.
-      // As a heuristic, we'll use a threshold of 100 to ensure some distance from obstacles while being more tolerant.
-      if (map_[nbr] < 128) {
+      // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles while being more tolerant.
+      if (map_[nbr] < 50) {
         return true;
       }
     }
@@ -266,6 +268,7 @@ double FrontierSearch::frontierCost(
   const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
+  double critical_dose_mrem_hr,
   const cv::Mat & explored_grid)
 {
   frontier.info_gain = 0.0;
@@ -324,6 +327,21 @@ double FrontierSearch::frontierCost(
   if (!heatmap.empty()) {
     unsigned int mx, my;
     if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
+      int row = (heatmap.rows - 1) - my;
+      if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
+        float radiation = heatmap.at<float>(row, mx);
+        if (radiation >= critical_dose_mrem_hr) return std::numeric_limits<double>::infinity();
+      }
+    }
+    if (costmap_->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
+      int row = (heatmap.rows - 1) - my;
+      if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
+        float radiation = heatmap.at<float>(row, mx);
+        if (radiation >= critical_dose_mrem_hr) return std::numeric_limits<double>::infinity();
+      }
+    }
+
+    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
       int h_x = mx;
       int h_y = my;
 
@@ -331,6 +349,11 @@ double FrontierSearch::frontierCost(
         // Map h_y (bottom-up) to row index (top-down)
         int row = (heatmap.rows - 1) - h_y;
         float radiation = heatmap.at<float>(row, h_x);
+
+        // If radiation exceeds critical threshold, this frontier is lethal/invalid
+        if (radiation >= critical_dose_mrem_hr) {
+          return std::numeric_limits<double>::infinity();
+        }
 
         // Non-linear aggressive penalty (Request 1 refinement)
         // If radiation is high, the penalty should grow faster than the gain can offset.

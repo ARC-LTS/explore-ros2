@@ -72,14 +72,14 @@ Explore::Explore()
   double timeout;
   double min_frontier_size;
   bool auto_start;
-  this->declare_parameter<float>("planner_frequency", 1.0);
-  this->declare_parameter<float>("progress_timeout", 30.0);
+  this->declare_parameter<double>("planner_frequency", 1.0);
+  this->declare_parameter<double>("progress_timeout", 30.0);
   this->declare_parameter<bool>("visualize", false);
-  this->declare_parameter<float>("potential_scale", 1.0);
-  this->declare_parameter<float>("orientation_scale", 10.0);
-  this->declare_parameter<float>("gain_scale", 1.0);
-  this->declare_parameter<float>("min_frontier_size", 0.5);
-  this->declare_parameter<float>("min_frontier_clearance", 0.1);
+  this->declare_parameter<double>("potential_scale", 1.0);
+  this->declare_parameter<double>("orientation_scale", 10.0);
+  this->declare_parameter<double>("gain_scale", 1.0);
+  this->declare_parameter<double>("min_frontier_size", 0.5);
+  this->declare_parameter<double>("min_frontier_clearance", 0.1);
   this->declare_parameter<bool>("return_to_init", false);
   this->declare_parameter<bool>("auto_start", true);
   this->declare_parameter<int>("no_frontier_retry", 3);
@@ -93,6 +93,7 @@ Explore::Explore()
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
   this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
+  this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.25);
   this->declare_parameter<double>("radiation_scale", 1.0);
   this->declare_parameter<double>("radiation_gradient_scale", 1.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
@@ -119,6 +120,7 @@ Explore::Explore()
   this->get_parameter("heatmap_topic", heatmap_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
   this->get_parameter("critical_dose_mrem_hr", critical_dose_mrem_hr_);
+  this->get_parameter("safe_dose_threshold_mrem_hr", safe_dose_threshold_mrem_hr_);
   this->get_parameter("radiation_scale", radiation_scale_);
   this->get_parameter("radiation_gradient_scale", radiation_gradient_scale_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
@@ -307,6 +309,17 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
   if (dt > 0.0 && dt < 10.0) { // Sanity check for dt
     // Dose (mR) = rate (mR/hr) * time (hr)
     cumulative_dose_ += mR_hr * (dt / 3600.0);
+  }
+
+  if (current_radiation_rate_ > critical_dose_mrem_hr_) {
+    if (!is_recovering_ && goal_active_) {
+      RCLCPP_WARN(
+        logger_,
+        "Radiation recovery triggered at (%.2f, %.2f). Blacklisting current frontier goal.",
+        last_sent_goal_position_.x, last_sent_goal_position_.y);
+      frontier_blacklist_.push_back(last_sent_goal_position_);
+    }
+    is_recovering_ = true;
   }
 
   if (!exploration_finished_ && cumulative_dose_ > max_radiation_dose_) {
@@ -514,9 +527,27 @@ void Explore::makePlan()
 
   // --- Stage 0: Danger Check (Radiation) ---
   // If we are in a critical radiation zone, STOP exploration and let recovery handle it.
+  if (is_recovering_) {
+    if (current_radiation_rate_ > safe_dose_threshold_mrem_hr_) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *this->get_clock(), 5000,
+        "Robot in recovery state (%.2f mR/hr). Waiting for safe radiation (%.2f).",
+        current_radiation_rate_, safe_dose_threshold_mrem_hr_);
+      if (goal_active_) {
+        move_base_client_->async_cancel_goal(navigation_goal_handle_);
+        goal_active_ = false;
+      }
+      return;
+    } else {
+      is_recovering_ = false;
+      RCLCPP_INFO(logger_, "Radiation levels safe (%.2f). Resuming exploration.", current_radiation_rate_);
+    }
+  }
+
   if (current_radiation_rate_ > critical_dose_mrem_hr_) {
-    RCLCPP_WARN_THROTTLE(
-      logger_, *this->get_clock(), 5000,
+    is_recovering_ = true;
+    RCLCPP_WARN(
+      logger_,
       "Robot in CRITICAL radiation zone (%.2f mR/hr). Suspending frontier navigation.",
       current_radiation_rate_);
     if (goal_active_) {
@@ -527,51 +558,28 @@ void Explore::makePlan()
   }
 
   // --- Stage 1: Check current navigation goal status ---
-  if (goal_active_ || waiting_for_goal_response_) {
-    bool should_cancel_current_goal = false;
+  if (waiting_for_goal_response_) {
+    RCLCPP_DEBUG(logger_, "Waiting for goal response. Deferring new plan.");
+    return;
+  }
 
-    // Check for timeout (only if goal is active, not just waiting for response)
-    if (goal_active_ && (this->now() - last_progress_) > tf2::durationFromSec(progress_timeout_)) {
-      RCLCPP_WARN(
-        logger_,
-        "Active navigation goal has timed out after %.2f seconds. Cancelling current goal and re-planning.",
-        progress_timeout_);
-      should_cancel_current_goal = true;
-    } else if (goal_active_) { // If active and not timed out, check traversability
-      nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
-      unsigned int mx, my;
-      if (costmap->worldToMap(last_sent_goal_position_.x, last_sent_goal_position_.y, mx, my)) {
-        unsigned char cost = costmap->getCost(mx, my);
-        // Use INSCRIBED_INFLATED_OBSTACLE (253) as hard limit for robot center traversability.
-        if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-          RCLCPP_INFO(
-            logger_,
-            "Current navigation goal (%.2f, %.2f) is now blocked (cost: %d). Cancelling and blacklisting.", last_sent_goal_position_.x, last_sent_goal_position_.y,
-            cost);
-          frontier_blacklist_.push_back(last_sent_goal_position_);
-          should_cancel_current_goal = true;
-        }
-      } else { // Goal outside map, potentially invalid, treat as blocked.
-        RCLCPP_WARN(
-          logger_,
-          "Current navigation goal (%.2f, %.2f) is outside map bounds. Cancelling and blacklisting.", last_sent_goal_position_.x,
-          last_sent_goal_position_.y);
-        frontier_blacklist_.push_back(last_sent_goal_position_);
-        should_cancel_current_goal = true;
-      }
+  bool is_current_goal_invalid = false;
+  if (goal_active_) {
+    // 1. Check for timeout
+    if ((this->now() - last_progress_) > tf2::durationFromSec(progress_timeout_)) {
+      RCLCPP_WARN(logger_, "Active goal timed out. Re-planning.");
+      is_current_goal_invalid = true;
     }
-
-    if (should_cancel_current_goal) {
-      if (navigation_goal_handle_) {
-        move_base_client_->async_cancel_goal(navigation_goal_handle_);
+    // 2. Check if current goal is now blocked
+    nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
+    unsigned int mx, my;
+    if (costmap->worldToMap(last_sent_goal_position_.x, last_sent_goal_position_.y, mx, my)) {
+      unsigned char cost = costmap->getCost(mx, my);
+      if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting and re-planning.");
+        frontier_blacklist_.push_back(last_sent_goal_position_);
+        is_current_goal_invalid = true;
       }
-      // Goal state will be reset in resultCallback.
-      // Allow to continue to find a new goal.
-    } else { // Goal is still active/waiting and not cancelled.
-      RCLCPP_DEBUG(
-        logger_,
-        "Current navigation goal still active or waiting response. Deferring new plan generation.");
-      return;   // Stick to the current goal.
     }
   }
 
@@ -589,88 +597,79 @@ void Explore::makePlan()
     initial_pose_.position, energy_per_meter_,
     battery_safety_margin_, battery_penalty_scale_,
     min_frontier_clearance_, latest_heatmap_,
-    radiation_scale_, radiation_gradient_scale_, explored_grid_);
+    radiation_scale_, radiation_gradient_scale_,
+    critical_dose_mrem_hr_, explored_grid_);
 
-  RCLCPP_INFO(
-    logger_, "Status: Explored %d frontiers, %lu currently available.",
-    frontiers_explored_count_, frontiers.size());
   if (visualize_) {
     visualizeFrontiers(frontiers);
   }
 
-  // --- Stage 3: Select a valid frontier ---
-  auto frontier = std::find_if_not(
+  // Stage 3: Select valid frontier
+  auto frontier_it = std::find_if_not(
     frontiers.begin(), frontiers.end(),
     [this, &pose](const frontier_exploration::Frontier & f) {
-      if (goalOnBlacklist(f.centroid)) {
-        return true;
-      }
+      if (goalOnBlacklist(f.centroid)) return true;
+      // Distance check
       double dx = f.centroid.x - pose.position.x;
       double dy = f.centroid.y - pose.position.y;
-      if (dx * dx + dy * dy < 0.75 * 0.75) {
-        RCLCPP_DEBUG(
-          logger_, "Skipping frontier at (%.2f, %.2f) - too close to robot",
-          f.centroid.x, f.centroid.y);
-        return true;
-      }
+      if (dx * dx + dy * dy < 0.5 * 0.5) return true;
       return false;
     });
 
-  // --- Stage 4: Handle no valid frontiers (with robust verification) ---
-  if (frontiers.empty() || frontier == frontiers.end()) {
-    no_frontier_count_++;
-    if (no_frontier_count_ >= no_frontier_retry_) {
-      RCLCPP_WARN(
-        logger_,
-        "No valid frontiers found after %d retries. Explored %d frontiers. Starting verification phase.",
-        no_frontier_count_, frontiers_explored_count_);
-      no_frontier_count_ = 0;
-      startVerification();
-    } else {
-      RCLCPP_INFO(
-        logger_, "No valid frontiers found, retry %d/%d", no_frontier_count_,
-        no_frontier_retry_);
+  // Handle no valid frontiers
+  if (frontiers.empty() || frontier_it == frontiers.end()) {
+    if (!goal_active_) {
+      no_frontier_count_++;
+      if (no_frontier_count_ >= no_frontier_retry_) {
+        no_frontier_count_ = 0;
+        startVerification();
+      }
     }
     return;
   }
 
-  // Frontiers found, reset verification state
-  is_verifying_ = false;
-  verification_attempts_ = 0;
+  geometry_msgs::msg::Point new_target = findSafeViewpoint(*frontier_it);
 
-  geometry_msgs::msg::Point target_position = frontier->middle;
+  // Opportunistic Preemption Check
+  if (goal_active_ && !is_current_goal_invalid) {
+    double dx = new_target.x - last_sent_goal_position_.x;
+    double dy = new_target.y - last_sent_goal_position_.y;
+    double dist_to_new = sqrt(dx * dx + dy * dy);
 
-  // --- Stage 5: Send the new navigation goal ---
-  RCLCPP_INFO(
-    logger_, "Sending new navigation goal to (%.2f, %.2f).", target_position.x,
-    target_position.y);
+    // If the new target is far from the old one, it means our current target
+    // was likely explored/consumed or a much better one appeared.
+    if (dist_to_new < min_goal_distance_for_replanning_) {
+      return; // Stick to current goal
+    }
+    RCLCPP_INFO(logger_, "Found significantly better frontier. Preempting current goal.");
+  }
+
+  // --- Stage 5: Send the goal ---
+  RCLCPP_INFO(logger_, "Sending navigation goal to (%.2f, %.2f).", new_target.x, new_target.y);
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = target_position;
-  double yaw = atan2(target_position.y - pose.position.y, target_position.x - pose.position.x);
+  goal.pose.pose.position = new_target;
+  double yaw = atan2(new_target.y - pose.position.y, new_target.x - pose.position.x);
   tf2::Quaternion q;
   q.setRPY(0, 0, yaw);
   goal.pose.pose.orientation = tf2::toMsg(q);
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
-  auto send_goal_options =
-    rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
   send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
   send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
-  send_goal_options.result_callback =
-    std::bind(&Explore::resultCallback, this, _1, target_position);
+  send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, new_target);
 
   waiting_for_goal_response_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
 
-  last_sent_goal_position_ = target_position;
+  last_sent_goal_position_ = new_target;
   goal_start_pose_ = pose;
-  prev_goal_ = target_position;
-  prev_distance_ = std::numeric_limits<double>::infinity();
-  last_recovery_count_ = 0;
   last_progress_ = this->now();
+  prev_distance_ = std::numeric_limits<double>::infinity();
   no_frontier_count_ = 0;
   last_goal_successful_ = false;
+}
 }
 
 void Explore::handleExplorationCompletion(bool force_return)
@@ -952,6 +951,67 @@ void Explore::resume()
   exploring_timer_->reset();
   // Resume immediately
   makePlan();
+}
+
+geometry_msgs::msg::Point Explore::findSafeViewpoint(const frontier_exploration::Frontier & frontier)
+{
+  nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
+  unsigned int mx, my;
+  if (!costmap->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
+    return frontier.middle;
+  }
+
+  // Search in a small radius around the frontier point for a cell that is:
+  // 1. FREE_SPACE (cost 0 or very low)
+  // 2. Not adjacent to lethal/inscribed obstacles
+  
+  double resolution = costmap->getResolution();
+  double search_radius = 1.0; // Search within 1 meter
+  int cell_radius = static_cast<int>(search_radius / resolution);
+  
+  geometry_msgs::msg::Point safe_point = frontier.middle;
+  unsigned char min_cost = 255;
+  double min_dist_to_robot = std::numeric_limits<double>::infinity();
+  
+  auto robot_pose = costmap_client_.getRobotPose();
+
+  for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
+    for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
+      int cx = static_cast<int>(mx) + dx;
+      int cy = static_cast<int>(my) + dy;
+      
+      if (cx < 0 || cx >= static_cast<int>(costmap->getSizeInCellsX()) || 
+          cy < 0 || cy >= static_cast<int>(costmap->getSizeInCellsY())) continue;
+      
+      unsigned char cost = costmap->getCost(cx, cy);
+      
+      // We want a point that is FREE and away from obstacles.
+      // Lower cost is better. Cost 0 is ideal (FREE_SPACE).
+      if (cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE && cost < 50) {
+        double wx, wy;
+        costmap->mapToWorld(cx, cy, wx, wy);
+        
+        // Let's favor points that are closer to the robot than the frontier itself to "pull" the waypoint back.
+        double dx_r = wx - robot_pose.position.x;
+        double dy_r = wy - robot_pose.position.y;
+        double dist_to_robot = dx_r * dx_r + dy_r * dy_r;
+        
+        // Prefer lower cost first, then closer to robot
+        if (cost < min_cost) {
+          min_cost = cost;
+          min_dist_to_robot = dist_to_robot;
+          safe_point.x = wx;
+          safe_point.y = wy;
+        } else if (cost == min_cost && dist_to_robot < min_dist_to_robot) {
+          min_dist_to_robot = dist_to_robot;
+          safe_point.x = wx;
+          safe_point.y = wy;
+        }
+      }
+    }
+  }
+  
+  return safe_point;
 }
 
 }  // namespace explore

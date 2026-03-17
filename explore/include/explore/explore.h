@@ -215,7 +215,9 @@ private:
     double radiation_scale_;
     double radiation_gradient_scale_;
     double critical_dose_mrem_hr_;
+    double safe_dose_threshold_mrem_hr_;
     double current_radiation_rate_ = 0.0;
+    bool is_recovering_ = false;
     cv::Mat latest_heatmap_;
 
     // Explored area tracking
@@ -227,6 +229,7 @@ private:
 
     void handleExplorationCompletion(bool force_return = false);
     void startVerification();
+    geometry_msgs::msg::Point findSafeViewpoint(const frontier_exploration::Frontier & frontier);
   };
 }  // namespace explore
 
