@@ -93,7 +93,7 @@ Explore::Explore()
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
   this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
-  this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.25);
+  this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.5);
   this->declare_parameter<double>("radiation_scale", 1.0);
   this->declare_parameter<double>("radiation_gradient_scale", 1.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
@@ -157,6 +157,11 @@ Explore::Explore()
       "explored_area",
       rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
   }
+
+  exploration_finished_publisher_ =
+    this->create_publisher<std_msgs::msg::Bool>(
+    "explore/is_finished",
+    rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
 
   // Subscription to resume or stop exploration
   resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
@@ -527,35 +532,31 @@ void Explore::makePlan()
   }
 
   // --- Stage 0: Danger Check (Radiation) ---
-  // If we are in a critical radiation zone, STOP exploration and let recovery handle it.
+  // If we are in a critical radiation zone, we must replan to a safe area.
   if (is_recovering_) {
-    if (current_radiation_rate_ > safe_dose_threshold_mrem_hr_) {
+    if (current_radiation_rate_ <= safe_dose_threshold_mrem_hr_) {
+      is_recovering_ = false;
+      RCLCPP_INFO(logger_, "Radiation levels safe (%.2f). Resuming normal exploration.", current_radiation_rate_);
+    } else {
       RCLCPP_WARN_THROTTLE(
         logger_, *this->get_clock(), 5000,
-        "Robot in recovery state (%.2f mR/hr). Waiting for safe radiation (%.2f).",
-        current_radiation_rate_, safe_dose_threshold_mrem_hr_);
-      if (goal_active_) {
-        move_base_client_->async_cancel_goal(navigation_goal_handle_);
-        goal_active_ = false;
-      }
-      return;
-    } else {
-      is_recovering_ = false;
-      RCLCPP_INFO(logger_, "Radiation levels safe (%.2f). Resuming exploration.", current_radiation_rate_);
+        "Robot in recovery state (%.2f mR/hr). Prioritizing safety in planning.",
+        current_radiation_rate_);
     }
   }
 
   if (current_radiation_rate_ > critical_dose_mrem_hr_) {
-    is_recovering_ = true;
-    RCLCPP_WARN(
-      logger_,
-      "Robot in CRITICAL radiation zone (%.2f mR/hr). Suspending frontier navigation.",
-      current_radiation_rate_);
-    if (goal_active_) {
-      move_base_client_->async_cancel_goal(navigation_goal_handle_);
-      goal_active_ = false;
+    if (!is_recovering_) {
+      RCLCPP_WARN(
+        logger_,
+        "Robot in CRITICAL radiation zone (%.2f mR/hr). Canceling current goal to find safer path.",
+        current_radiation_rate_);
+      is_recovering_ = true;
+      if (goal_active_) {
+        move_base_client_->async_cancel_goal(navigation_goal_handle_);
+        goal_active_ = false;
+      }
     }
-    return;
   }
 
   // --- Stage 1: Check current navigation goal status ---
@@ -698,14 +699,20 @@ void Explore::handleExplorationCompletion(bool force_return)
     return;
   }
   exploration_finished_ = true;
+  std_msgs::msg::Bool finished_msg;
+  finished_msg.data = true;
+  exploration_finished_publisher_->publish(finished_msg);
 
   RCLCPP_WARN(logger_, "Exploration finished: no more frontiers found or all traversed/tried out.");
 
   // 1. Halt exploration (cancel current goal, stop timer)
   RCLCPP_INFO(logger_, "Halting exploration due to completion.");
-  move_base_client_->async_cancel_all_goals(); // Cancel any active navigation goal
+  if (goal_active_) {
+    move_base_client_->async_cancel_goal(navigation_goal_handle_);
+  }
   exploring_timer_->cancel(); // Stop the main planning loop
   goal_active_ = false; // Ensure goal active state is reset
+  has_last_trajectory_ = false;
 
   // 2. Return to original pose, if configured or forced
   if (return_to_init_ || force_return) {
@@ -810,15 +817,22 @@ void Explore::returnToInitialPose()
 
   auto send_goal_options =
     rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  
+  send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
+  
   send_goal_options.result_callback =
     [this](const NavigationGoalHandle::WrappedResult & result) {
+      goal_active_ = false;
       if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
         RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
       } else {
         RCLCPP_WARN(logger_, "Failed to return to initial pose: %d", static_cast<int>(result.code));
       }
     };
+  
+  waiting_for_goal_response_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
+  last_sent_goal_position_ = initial_pose_.position;
 }
 
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point & goal)
@@ -950,7 +964,9 @@ void Explore::stop(bool finished_exploring)
 {
   exploration_finished_ = finished_exploring;
   RCLCPP_INFO(logger_, "Exploration stopped.");
-  move_base_client_->async_cancel_all_goals();
+  if (goal_active_) {
+    move_base_client_->async_cancel_goal(navigation_goal_handle_);
+  }
   exploring_timer_->cancel();
   waiting_for_goal_response_ = false;
   goal_active_ = false;
@@ -966,6 +982,7 @@ void Explore::resume()
   exploration_finished_ = false;
   resuming_ = true;
   no_frontier_count_ = 0;
+  has_last_trajectory_ = false;
   RCLCPP_INFO(logger_, "Exploration resuming.");
   // Reactivate the timer
   exploring_timer_->reset();

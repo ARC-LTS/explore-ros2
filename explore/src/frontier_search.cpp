@@ -369,8 +369,13 @@ double FrontierSearch::frontierCost(
         if (radiation_gradient_scale != 0 && h_x > 0 && h_x < heatmap.cols - 1 && h_y > 0 &&
           h_y < heatmap.rows - 1)
         {
-          float grad_x = (heatmap.at<float>(h_y, h_x + 1) - heatmap.at<float>(h_y, h_x - 1)) / 2.0;
-          float grad_y = (heatmap.at<float>(h_y + 1, h_x) - heatmap.at<float>(h_y - 1, h_x)) / 2.0;
+          int row = (heatmap.rows - 1) - h_y;
+          float grad_x = (heatmap.at<float>(row, h_x + 1) - heatmap.at<float>(row, h_x - 1)) / 2.0;
+          // Note: In heatmap (top-down), row decreases as y (bottom-up) increases.
+          // d(rad)/dy = d(rad)/d(row) * d(row)/dy = d(rad)/d(row) * (-1)
+          // d(rad)/d(row) is approx (rad(row+1) - rad(row-1)) / 2
+          // So d(rad)/dy is (rad(row-1) - rad(row+1)) / 2
+          float grad_y = (heatmap.at<float>(row - 1, h_x) - heatmap.at<float>(row + 1, h_x)) / 2.0;
 
           // Vector from robot to frontier
           double dx = frontier.centroid.x - robot_pos.x;

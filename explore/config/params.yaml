@@ -21,8 +21,8 @@
     battery_penalty_scale: 1.0
     max_battery_used: 0.8
     max_radiation_dose: 100.0
-    critical_dose_mrem_hr: 2.0
-    safe_dose_threshold_mrem_hr: 0.25
+    critical_dose_mrem_hr: 5.0
+    safe_dose_threshold_mrem_hr: 0.5
     radiation_topic: rad
     heatmap_topic: /rad_heatmap/raw_mean_map
     radiation_scale: 1.0
