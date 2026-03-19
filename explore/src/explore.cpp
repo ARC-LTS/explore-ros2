@@ -531,6 +531,8 @@ void Explore::makePlan()
     return;
   }
 
+  auto pose = costmap_client_.getRobotPose();
+
   // --- Stage 0: Danger Check (Radiation) ---
   // If we are in a critical radiation zone, we must replan to a safe area.
   if (is_recovering_) {
@@ -577,14 +579,24 @@ void Explore::makePlan()
     unsigned int mx, my;
     if (costmap->worldToMap(last_sent_goal_position_.x, last_sent_goal_position_.y, mx, my)) {
       unsigned char cost = costmap->getCost(mx, my);
-      // If it's an obstacle (>= 253) OR if it's already been explored (not NO_INFORMATION/255)
+      // If it's an obstacle (>= 253)
       if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
         RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting.");
         frontier_blacklist_.push_back(last_sent_goal_position_);
         is_current_goal_invalid = true;
       } else if (cost != nav2_costmap_2d::NO_INFORMATION) {
-        RCLCPP_INFO(logger_, "Current goal area already explored by sensors. Switching targets.");
-        is_current_goal_invalid = true;
+        // If it's already been explored, we only cancel if we are reasonably close to it.
+        // This prevents 'target switching' loops where SLAM clears the goal area just before arrival.
+        double dx = last_sent_goal_position_.x - pose.position.x;
+        double dy = last_sent_goal_position_.y - pose.position.y;
+        double dist_sq = dx * dx + dy * dy;
+        
+        if (dist_sq < 0.5 * 0.5) { // 0.5m threshold
+            RCLCPP_INFO(logger_, "Current goal area already explored by sensors and reached. Switching targets.");
+            // Blacklist the reached goal to prevent immediate re-targeting of the same spot
+            frontier_blacklist_.push_back(last_sent_goal_position_);
+            is_current_goal_invalid = true;
+        }
       }
     }
 
@@ -597,7 +609,6 @@ void Explore::makePlan()
 
   // --- Stage 2: Find the best new frontier ---
   updateExploredArea();
-  auto pose = costmap_client_.getRobotPose();
   double robot_yaw = tf2::getYaw(pose.orientation);
   double search_yaw = robot_yaw;
   if (has_last_trajectory_) {
