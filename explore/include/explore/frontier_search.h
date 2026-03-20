@@ -60,7 +60,8 @@ public:
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
       double critical_dose_mrem_hr = 2.0,
-      const cv::Mat & explored_grid = cv::Mat());
+      const cv::Mat & explored_grid = cv::Mat(),
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point());
 
 protected:
     /**
@@ -73,9 +74,10 @@ protected:
      * @return new frontier
      */
     Frontier buildNewFrontier(
-      unsigned int initial_cell, unsigned int reference,
+      unsigned int initial_cell,
       std::vector < bool > & frontier_flag,
-      double min_frontier_clearance);
+      double min_frontier_clearance,
+      const std::vector < double > & dist_map);
 
     /**
      * @brief isNewFrontierCell Evaluate if candidate cell is a valid candidate
@@ -110,7 +112,8 @@ protected:
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
       double critical_dose_mrem_hr = 2.0,
-      const cv::Mat & explored_grid = cv::Mat());
+      const cv::Mat & explored_grid = cv::Mat(),
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point());
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;

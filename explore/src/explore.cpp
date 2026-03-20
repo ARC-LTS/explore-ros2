@@ -538,7 +538,9 @@ void Explore::makePlan()
   if (is_recovering_) {
     if (current_radiation_rate_ <= safe_dose_threshold_mrem_hr_) {
       is_recovering_ = false;
-      RCLCPP_INFO(logger_, "Radiation levels safe (%.2f). Resuming normal exploration.", current_radiation_rate_);
+      RCLCPP_INFO(
+        logger_, "Radiation levels safe (%.2f). Resuming normal exploration.",
+        current_radiation_rate_);
     } else {
       RCLCPP_WARN_THROTTLE(
         logger_, *this->get_clock(), 5000,
@@ -590,12 +592,14 @@ void Explore::makePlan()
         double dx = last_sent_goal_position_.x - pose.position.x;
         double dy = last_sent_goal_position_.y - pose.position.y;
         double dist_sq = dx * dx + dy * dy;
-        
-        if (dist_sq < 0.5 * 0.5) { // 0.5m threshold
-            RCLCPP_INFO(logger_, "Current goal area already explored by sensors and reached. Switching targets.");
-            // Blacklist the reached goal to prevent immediate re-targeting of the same spot
-            frontier_blacklist_.push_back(last_sent_goal_position_);
-            is_current_goal_invalid = true;
+
+        if (dist_sq < min_goal_distance_for_replanning_ * min_goal_distance_for_replanning_) {
+          RCLCPP_INFO(
+            logger_,
+            "Current goal area already explored by sensors and reached. Switching targets.");
+          // Blacklist the reached goal to prevent immediate re-targeting of the same spot
+          frontier_blacklist_.push_back(last_sent_goal_position_);
+          is_current_goal_invalid = true;
         }
       }
     }
@@ -621,7 +625,8 @@ void Explore::makePlan()
     battery_safety_margin_, battery_penalty_scale_,
     min_frontier_clearance_, latest_heatmap_,
     radiation_scale_, radiation_gradient_scale_,
-    critical_dose_mrem_hr_, explored_grid_);
+    critical_dose_mrem_hr_, explored_grid_,
+    goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point());
 
   if (visualize_) {
     visualizeFrontiers(frontiers);
@@ -631,13 +636,17 @@ void Explore::makePlan()
   auto frontier_it = std::find_if_not(
     frontiers.begin(), frontiers.end(),
     [this, &pose](const frontier_exploration::Frontier & f) {
-      if (goalOnBlacklist(f.centroid)) return true;
+      if (goalOnBlacklist(f.centroid)) {return true;}
       // If we already have an active goal, don't pick the same one as the current target
-      if (goal_active_ && same_point(f.centroid, last_sent_goal_position_)) return true;
-      // Distance check
+      if (goal_active_ && same_point(
+        f.centroid,
+        last_sent_goal_position_)) {return true;}
+      // Distance check: ignore frontiers too close to the robot
       double dx = f.centroid.x - pose.position.x;
       double dy = f.centroid.y - pose.position.y;
-      if (dx * dx + dy * dy < 0.5 * 0.5) return true;
+      if (dx * dx + dy * dy < min_goal_distance_for_replanning_ * min_goal_distance_for_replanning_) {
+        return true;
+      }
       return false;
     });
 
@@ -660,8 +669,10 @@ void Explore::makePlan()
   if (goal_active_) {
     queued_target_ = best_target;
     has_queued_target_ = true;
-    RCLCPP_DEBUG(logger_, "Queued next target (%.2f, %.2f) while moving.", best_target.x, best_target.y);
-    return; 
+    RCLCPP_DEBUG(
+      logger_, "Queued next target (%.2f, %.2f) while moving.", best_target.x,
+      best_target.y);
+    return;
   }
 
   // If we get here, no goal is active (or it was just invalidated).
@@ -678,7 +689,7 @@ void Explore::sendGoal(const geometry_msgs::msg::Point & target)
 {
   auto pose = costmap_client_.getRobotPose();
   RCLCPP_INFO(logger_, "Sending navigation goal to (%.2f, %.2f).", target.x, target.y);
-  
+
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = target;
   double yaw = atan2(target.y - pose.position.y, target.x - pose.position.x);
@@ -688,7 +699,8 @@ void Explore::sendGoal(const geometry_msgs::msg::Point & target)
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
-  auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  auto send_goal_options =
+    rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
   send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
   send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
   send_goal_options.result_callback = std::bind(&Explore::resultCallback, this, _1, target);
@@ -828,9 +840,9 @@ void Explore::returnToInitialPose()
 
   auto send_goal_options =
     rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  
+
   send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
-  
+
   send_goal_options.result_callback =
     [this](const NavigationGoalHandle::WrappedResult & result) {
       goal_active_ = false;
@@ -840,7 +852,7 @@ void Explore::returnToInitialPose()
         RCLCPP_WARN(logger_, "Failed to return to initial pose: %d", static_cast<int>(result.code));
       }
     };
-  
+
   waiting_for_goal_response_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
   last_sent_goal_position_ = initial_pose_.position;
@@ -1001,7 +1013,8 @@ void Explore::resume()
   makePlan();
 }
 
-geometry_msgs::msg::Point Explore::findSafeViewpoint(const frontier_exploration::Frontier & frontier)
+geometry_msgs::msg::Point Explore::findSafeViewpoint(
+  const frontier_exploration::Frontier & frontier)
 {
   nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
   unsigned int mx, my;
@@ -1012,38 +1025,38 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(const frontier_exploration:
   // Search in a small radius around the frontier point for a cell that is:
   // 1. FREE_SPACE (cost 0 or very low)
   // 2. Not adjacent to lethal/inscribed obstacles
-  
+
   double resolution = costmap->getResolution();
   double search_radius = 1.0; // Search within 1 meter
   int cell_radius = static_cast<int>(search_radius / resolution);
-  
+
   geometry_msgs::msg::Point safe_point = frontier.middle;
   unsigned char min_cost = 255;
   double min_dist_to_robot = std::numeric_limits<double>::infinity();
-  
+
   auto robot_pose = costmap_client_.getRobotPose();
 
   for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
     for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
       int cx = static_cast<int>(mx) + dx;
       int cy = static_cast<int>(my) + dy;
-      
-      if (cx < 0 || cx >= static_cast<int>(costmap->getSizeInCellsX()) || 
-          cy < 0 || cy >= static_cast<int>(costmap->getSizeInCellsY())) continue;
-      
+
+      if (cx < 0 || cx >= static_cast<int>(costmap->getSizeInCellsX()) ||
+        cy < 0 || cy >= static_cast<int>(costmap->getSizeInCellsY())) {continue;}
+
       unsigned char cost = costmap->getCost(cx, cy);
-      
+
       // We want a point that is FREE and away from obstacles.
       // Lower cost is better. Cost 0 is ideal (FREE_SPACE).
       if (cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE && cost < 50) {
         double wx, wy;
         costmap->mapToWorld(cx, cy, wx, wy);
-        
+
         // Let's favor points that are closer to the robot than the frontier itself to "pull" the waypoint back.
         double dx_r = wx - robot_pose.position.x;
         double dy_r = wy - robot_pose.position.y;
         double dist_to_robot = dx_r * dx_r + dy_r * dy_r;
-        
+
         // Prefer lower cost first, then closer to robot
         if (cost < min_cost) {
           min_cost = cost;
@@ -1058,7 +1071,7 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(const frontier_exploration:
       }
     }
   }
-  
+
   return safe_point;
 }
 

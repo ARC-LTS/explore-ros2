@@ -3,6 +3,8 @@
 
 #include <geometry_msgs/msg/point.hpp>
 #include <mutex>
+#include <queue>
+#include <limits>
 
 #include "nav2_costmap_2d/cost_values.hpp"
 
@@ -40,7 +42,8 @@ FrontierSearch::searchFrom(
   double radiation_scale,
   double radiation_gradient_scale,
   double critical_dose_mrem_hr,
-  const cv::Mat & explored_grid)
+  const cv::Mat & explored_grid,
+  const geometry_msgs::msg::Point & current_goal)
 {
   std::vector<Frontier> frontier_list;
 
@@ -64,42 +67,62 @@ FrontierSearch::searchFrom(
   // initialize flag arrays to keep track of visited and frontier cells
   std::vector<bool> frontier_flag(size_x_ * size_y_, false);
   std::vector<bool> visited_flag(size_x_ * size_y_, false);
+  std::vector<double> dist_map(size_x_ * size_y_, std::numeric_limits<double>::infinity());
 
-  // initialize breadth first search
-  std::queue<unsigned int> bfs;
+  // initialize priority queue for Dijkstra
+  typedef std::pair<double, unsigned int> Cell;
+  std::priority_queue<Cell, std::vector<Cell>, std::greater<Cell>> pq;
 
   // find closest traversable cell to start search
   unsigned int clear, pos = costmap_->getIndex(mx, my);
+  unsigned int start_idx;
   if (map_[pos] < LETHAL_OBSTACLE) {
-    bfs.push(pos);
+    start_idx = pos;
   } else if (nearestCell(clear, pos, FREE_SPACE, *costmap_)) {
-    bfs.push(clear);
+    start_idx = clear;
   } else {
-    bfs.push(pos);
+    start_idx = pos;
     RCLCPP_WARN(
       logger_,
       "[FrontierSearch] Could not find traversable cell to start search from robot position");
   }
-  visited_flag[bfs.front()] = true;
 
-  while (!bfs.empty()) {
-    unsigned int idx = bfs.front();
-    bfs.pop();
+  dist_map[start_idx] = 0.0;
+  pq.push({0.0, start_idx});
 
-    // iterate over 4-connected neighbourhood
-    for (unsigned nbr : nhood4(idx, *costmap_)) {
+  double res = costmap_->getResolution();
+  double diag = res * 1.41421356;
+
+  while (!pq.empty()) {
+    Cell current = pq.top();
+    pq.pop();
+    unsigned int idx = current.second;
+    double d = current.first;
+
+    if (d > dist_map[idx]) {continue;}
+    if (visited_flag[idx]) {continue;}
+    visited_flag[idx] = true;
+
+    // iterate over 8-connected neighbourhood for Dijkstra
+    for (unsigned nbr : nhood8(idx, *costmap_)) {
       // add to queue all free, unvisited cells
-      if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE && !visited_flag[nbr]) {
-        visited_flag[nbr] = true;
-        bfs.push(nbr);
-        // check if cell is new frontier cell (unvisited, NO_INFORMATION, free
-        // neighbour)
+      if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        unsigned int nx, ny, ix, iy;
+        costmap_->indexToCells(nbr, nx, ny);
+        costmap_->indexToCells(idx, ix, iy);
+        double step = (nx != ix && ny != iy) ? diag : res;
+        double new_dist = d + step;
+
+        if (new_dist < dist_map[nbr]) {
+          dist_map[nbr] = new_dist;
+          pq.push({new_dist, nbr});
+        }
       } else if (isNewFrontierCell(nbr, frontier_flag, min_frontier_clearance)) {
         frontier_flag[nbr] = true;
-        Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag, min_frontier_clearance);
-        if (new_frontier.size * costmap_->getResolution() >=
-          min_frontier_size_)
-        {
+        Frontier new_frontier = buildNewFrontier(
+          nbr, frontier_flag, min_frontier_clearance,
+          dist_map);
+        if (new_frontier.size * res >= min_frontier_size_) {
           frontier_list.push_back(new_frontier);
         }
       }
@@ -111,8 +134,8 @@ FrontierSearch::searchFrom(
     frontier.cost = frontierCost(
       frontier, robot_yaw, battery_state, position, home_pos,
       energy_per_meter, battery_safety_margin, battery_penalty_scale,
-      heatmap, radiation_scale, radiation_gradient_scale, 
-      critical_dose_mrem_hr, explored_grid);
+      heatmap, radiation_scale, radiation_gradient_scale,
+      critical_dose_mrem_hr, explored_grid, current_goal);
   }
   std::sort(
     frontier_list.begin(), frontier_list.end(),
@@ -123,9 +146,9 @@ FrontierSearch::searchFrom(
 
 Frontier FrontierSearch::buildNewFrontier(
   unsigned int initial_cell,
-  unsigned int reference,
   std::vector<bool> & frontier_flag,
-  double min_frontier_clearance)
+  double min_frontier_clearance,
+  const std::vector<double> & dist_map)
 {
   // initialize frontier structure
   Frontier output;
@@ -133,6 +156,24 @@ Frontier FrontierSearch::buildNewFrontier(
   output.centroid.y = 0;
   output.size = 0; // Initialize size to 0, it will be incremented for valid points.
   output.min_distance = std::numeric_limits<double>::infinity();
+
+  double res = costmap_->getResolution();
+  double diag = res * 1.41421356;
+
+  auto get_path_dist = [&](unsigned int cell_idx) -> double {
+      double min_d = std::numeric_limits<double>::infinity();
+      unsigned int cx, cy;
+      costmap_->indexToCells(cell_idx, cx, cy);
+      for (unsigned int n : nhood8(cell_idx, *costmap_)) {
+        if (dist_map[n] < std::numeric_limits<double>::infinity()) {
+          unsigned int nx, ny;
+          costmap_->indexToCells(n, nx, ny);
+          double step = (nx != cx && ny != cy) ? diag : res;
+          min_d = std::min(min_d, dist_map[n] + step);
+        }
+      }
+      return min_d;
+    };
 
   // record initial contact point for frontier
   unsigned int ix, iy;
@@ -144,22 +185,13 @@ Frontier FrontierSearch::buildNewFrontier(
   output.points.push_back(output.initial);
   output.centroid.x = output.initial.x;
   output.centroid.y = output.initial.y;
+  output.min_distance = get_path_dist(initial_cell);
+  output.middle.x = output.initial.x;
+  output.middle.y = output.initial.y;
 
   // push initial gridcell onto queue
   std::queue<unsigned int> bfs;
   bfs.push(initial_cell);
-
-  // cache reference position in world coords
-  unsigned int rx, ry;
-  double reference_x, reference_y;
-  costmap_->indexToCells(reference, rx, ry);
-  costmap_->mapToWorld(rx, ry, reference_x, reference_y);
-
-  output.min_distance = sqrt(
-    pow((double(reference_x) - double(output.initial.x)), 2.0) +
-    pow((double(reference_y) - double(output.initial.y)), 2.0));
-  output.middle.x = output.initial.x;
-  output.middle.y = output.initial.y;
 
   while (!bfs.empty()) {
     unsigned int idx = bfs.front();
@@ -197,11 +229,8 @@ Frontier FrontierSearch::buildNewFrontier(
         output.centroid.x += wx;
         output.centroid.y += wy;
 
-        // determine frontier's distance from robot, going by closest gridcell
-        // to robot
-        double distance = sqrt(
-          pow((double(reference_x) - double(wx)), 2.0) +
-          pow((double(reference_y) - double(wy)), 2.0));
+        // determine frontier's distance from robot, using path distance
+        double distance = get_path_dist(nbr);
         if (distance < output.min_distance) {
           output.min_distance = distance;
           output.middle.x = wx;
@@ -269,7 +298,8 @@ double FrontierSearch::frontierCost(
   double radiation_scale,
   double radiation_gradient_scale,
   double critical_dose_mrem_hr,
-  const cv::Mat & explored_grid)
+  const cv::Mat & explored_grid,
+  const geometry_msgs::msg::Point & current_goal)
 {
   frontier.info_gain = 0.0;
   // Feasibility Check
@@ -330,14 +360,14 @@ double FrontierSearch::frontierCost(
       int row = (heatmap.rows - 1) - my;
       if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
         float radiation = heatmap.at<float>(row, mx);
-        if (radiation >= critical_dose_mrem_hr) return std::numeric_limits<double>::infinity();
+        if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
       }
     }
     if (costmap_->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
       int row = (heatmap.rows - 1) - my;
       if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
         float radiation = heatmap.at<float>(row, mx);
-        if (radiation >= critical_dose_mrem_hr) return std::numeric_limits<double>::infinity();
+        if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
       }
     }
 
@@ -426,6 +456,18 @@ double FrontierSearch::frontierCost(
     battery_penalty = battery_penalty_scale * adjusted_energy_cost;
   }
 
-  return original_cost + info_gain_cost + rad_cost + orientation_penalty + battery_penalty;
+  // Hysteresis Bonus: Give a small discount to the current goal area to avoid oscillations
+  double hysteresis_bonus = 0.0;
+  if (current_goal.x != 0 || current_goal.y != 0) {
+    double dx = frontier.centroid.x - current_goal.x;
+    double dy = frontier.centroid.y - current_goal.y;
+    double dist_to_current_sq = dx * dx + dy * dy;
+    if (dist_to_current_sq < 1.0 * 1.0) { // 1.0m radius
+      hysteresis_bonus = -0.1 * (1.0 - std::sqrt(dist_to_current_sq));
+    }
+  }
+
+  return original_cost + info_gain_cost + rad_cost + orientation_penalty + battery_penalty +
+         hysteresis_bonus;
 }
 }  // namespace frontier_exploration
