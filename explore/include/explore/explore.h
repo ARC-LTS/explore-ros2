@@ -94,6 +94,7 @@ public:
       rclcpp_action::ClientGoalHandle < nav2_msgs::action::NavigateToPose >;
 
 private:
+    void handleRecovery();
     /**
      * @brief  Make a global plan
      */
@@ -194,6 +195,7 @@ private:
     bool goal_active_ = false;
     bool waiting_for_goal_response_ = false;
     bool exploration_finished_ = false;
+    bool stopped_ = true;
     int no_frontier_count_ = 0;
     rclcpp::Time goal_sent_time_;
 
