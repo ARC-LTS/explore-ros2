@@ -52,7 +52,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
-#include <std_srvs/srv/trigger.hpp> // Add this line
+#include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -171,6 +173,8 @@ private:
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr stop_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr return_to_initial_pose_service_;
+    rclcpp::Service < std_srvs::srv::SetBool > ::SharedPtr radiation_seeking_service_;
+    rclcpp::Publisher < std_msgs::msg::String > ::SharedPtr mode_publisher_;
 
     bool startExplorationServiceCallback(
       const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
@@ -181,6 +185,9 @@ private:
     bool returnToInitialPoseServiceCallback(
       const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
       std::shared_ptr < std_srvs::srv::Trigger::Response > response);
+    bool setRadiationSeekingCallback(
+      const std::shared_ptr < std_srvs::srv::SetBool::Request > request,
+      std::shared_ptr < std_srvs::srv::SetBool::Response > response);
 
     // parameters
     double planner_frequency_;
@@ -226,6 +233,7 @@ private:
     double safe_dose_threshold_mrem_hr_;
     double current_radiation_rate_ = 0.0;
     bool is_recovering_ = false;
+    bool radiation_seeking_mode_ = false;
     cv::Mat latest_heatmap_;
 
     // Explored area tracking

@@ -206,8 +206,10 @@ Explore::Explore()
     }
   }
 
-  exploring_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
+  exploring_timer_ = rclcpp::create_timer(
+    this,
+    this->get_clock(),
+    rclcpp::Duration::from_seconds(1.0 / planner_frequency_),
     [this]() {makePlan();});
 
   if (auto_start) {
@@ -234,6 +236,17 @@ Explore::Explore()
     std::bind(
       &Explore::returnToInitialPoseServiceCallback, this, std::placeholders::_1,
       std::placeholders::_2));
+
+  radiation_seeking_service_ = this->create_service<std_srvs::srv::SetBool>(
+    "~/set_radiation_seeking",
+    std::bind(
+      &Explore::setRadiationSeekingCallback, this, std::placeholders::_1,
+      std::placeholders::_2));
+
+  mode_publisher_ = this->create_publisher<std_msgs::msg::String>("~/mode", 10);
+  std_msgs::msg::String initial_mode;
+  initial_mode.data = "spatial_exploration";
+  mode_publisher_->publish(initial_mode);
 }
 
 Explore::~Explore()
@@ -307,6 +320,7 @@ void Explore::batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr ms
 void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
 {
   if (msg->data.size() < 2) {return;}
+  if (exploration_finished_) {return;}
 
   double mR_hr = msg->data[1];
   current_radiation_rate_ = mR_hr; // Store current rate
@@ -546,33 +560,26 @@ void Explore::makePlan()
   auto pose = pose_stamped.pose;
 
   // --- Stage 0: Danger Check (Radiation) ---
-  // If we are in a critical radiation zone, we must replan to a safe area.
+  // If in recovery, fully yield to local_recovery_node. Stop exploration
+  // so both nodes don't contend for navigation goals simultaneously.
+  // local_recovery_node will call /explore_node/start once safe.
   if (is_recovering_) {
-    if (current_radiation_rate_ <= safe_dose_threshold_mrem_hr_) {
-      is_recovering_ = false;
-      RCLCPP_INFO(
-        logger_, "Radiation levels safe (%.2f). Resuming normal exploration.",
-        current_radiation_rate_);
-    } else {
-      RCLCPP_WARN_THROTTLE(
-        logger_, *this->get_clock(), 5000,
-        "Robot in recovery state (%.2f mR/hr). Prioritizing safety in planning.",
-        current_radiation_rate_);
-    }
+    RCLCPP_WARN_THROTTLE(
+      logger_, *this->get_clock(), 5000,
+      "Radiation critical (%.2f mR/hr). Yielding to recovery node.",
+      current_radiation_rate_);
+    stop(false);
+    return;
   }
 
   if (current_radiation_rate_ > critical_dose_mrem_hr_) {
-    if (!is_recovering_) {
-      RCLCPP_WARN(
-        logger_,
-        "Robot in CRITICAL radiation zone (%.2f mR/hr). Canceling current goal to find safer path.",
-        current_radiation_rate_);
-      is_recovering_ = true;
-      if (goal_active_) {
-        move_base_client_->async_cancel_goal(navigation_goal_handle_);
-        goal_active_ = false;
-      }
-    }
+    RCLCPP_WARN(
+      logger_,
+      "Robot in CRITICAL radiation zone (%.2f mR/hr). Stopping exploration, yielding to recovery node.",
+      current_radiation_rate_);
+    is_recovering_ = true;
+    stop(false);
+    return;
   }
 
   // --- Stage 1: Check current navigation goal status ---
@@ -639,6 +646,27 @@ void Explore::makePlan()
     radiation_scale_, radiation_gradient_scale_,
     critical_dose_mrem_hr_, explored_grid_,
     goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point());
+
+  // In radiation-seeking mode, re-sort frontiers to prefer those nearest to
+  // high-radiation areas, turning the normal cost penalty into a reward.
+  if (radiation_seeking_mode_ && !latest_heatmap_.empty() && !frontiers.empty()) {
+    nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
+    std::stable_sort(
+      frontiers.begin(), frontiers.end(),
+      [&](const frontier_exploration::Frontier & a,
+        const frontier_exploration::Frontier & b) {
+        auto sample = [&](const geometry_msgs::msg::Point & pt) -> float {
+          unsigned int mx, my;
+          if (!costmap->worldToMap(pt.x, pt.y, mx, my)) {return 0.0f;}
+          int row = (latest_heatmap_.rows - 1) - static_cast<int>(my);
+          if (row < 0 || row >= latest_heatmap_.rows ||
+            mx >= static_cast<unsigned int>(latest_heatmap_.cols))
+          {return 0.0f;}
+          return latest_heatmap_.at<float>(row, static_cast<int>(mx));
+        };
+        return sample(a.centroid) > sample(b.centroid);
+      });
+  }
 
   if (visualize_) {
     visualizeFrontiers(frontiers);
@@ -1023,6 +1051,22 @@ void Explore::resultCallback(
   }
 }
 
+bool Explore::setRadiationSeekingCallback(
+  const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+  std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+{
+  radiation_seeking_mode_ = request->data;
+  std_msgs::msg::String mode_msg;
+  mode_msg.data = radiation_seeking_mode_ ? "radiation_seeking" : "spatial_exploration";
+  mode_publisher_->publish(mode_msg);
+  response->success = true;
+  response->message = radiation_seeking_mode_ ?
+    "Radiation-seeking mode enabled: prioritizing high-radiation frontiers." :
+    "Spatial exploration mode enabled: prioritizing coverage.";
+  RCLCPP_INFO(logger_, "%s", response->message.c_str());
+  return true;
+}
+
 void Explore::start()
 {
   exploration_finished_ = false;
@@ -1056,6 +1100,7 @@ void Explore::resume()
 {
   exploration_finished_ = false;
   stopped_ = false;
+  is_recovering_ = false;  // local_recovery_node confirmed safe before calling start
   resuming_ = true;
   no_frontier_count_ = 0;
   has_last_trajectory_ = false;
