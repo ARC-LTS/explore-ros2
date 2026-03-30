@@ -95,6 +95,8 @@ Explore::Explore()
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
   this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
+  this->declare_parameter<double>("acute_dose_rate_mrem_hr", 10.0);
+  this->declare_parameter<double>("dose_budget_scale", 10.0);
   this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.5);
   this->declare_parameter<double>("radiation_scale", 1.0);
   this->declare_parameter<double>("radiation_gradient_scale", 1.0);
@@ -122,6 +124,8 @@ Explore::Explore()
   this->get_parameter("heatmap_topic", heatmap_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
   this->get_parameter("critical_dose_mrem_hr", critical_dose_mrem_hr_);
+  this->get_parameter("acute_dose_rate_mrem_hr", acute_dose_rate_mrem_hr_);
+  this->get_parameter("dose_budget_scale", dose_budget_scale_);
   this->get_parameter("safe_dose_threshold_mrem_hr", safe_dose_threshold_mrem_hr_);
   this->get_parameter("radiation_scale", radiation_scale_);
   this->get_parameter("radiation_gradient_scale", radiation_gradient_scale_);
@@ -333,12 +337,17 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
     cumulative_dose_ += mR_hr * (dt / 3600.0);
   }
 
-  if (current_radiation_rate_ > critical_dose_mrem_hr_) {
+  // Trigger evacuation only on acute dose rates — genuinely dangerous readings
+  // that would consume a dangerous fraction of the remaining budget in seconds.
+  // Moderate radiation (> critical_dose_mrem_hr_ but < acute) is handled by
+  // the frontier cost function: the robot may traverse such areas if the
+  // cumulative dose budget permits.
+  if (current_radiation_rate_ > acute_dose_rate_mrem_hr_) {
     if (!is_recovering_ && goal_active_) {
       RCLCPP_WARN(
         logger_,
-        "Radiation recovery triggered at (%.2f, %.2f). Blacklisting current frontier goal.",
-        last_sent_goal_position_.x, last_sent_goal_position_.y);
+        "ACUTE radiation (%.2f mR/hr) at (%.2f, %.2f). Blacklisting and evacuating.",
+        current_radiation_rate_, last_sent_goal_position_.x, last_sent_goal_position_.y);
       frontier_blacklist_.push_back(last_sent_goal_position_);
     }
     is_recovering_ = true;
@@ -593,10 +602,10 @@ void Explore::makePlan()
     return;
   }
 
-  if (current_radiation_rate_ > critical_dose_mrem_hr_) {
+  if (current_radiation_rate_ > acute_dose_rate_mrem_hr_) {
     RCLCPP_WARN(
       logger_,
-      "Robot in CRITICAL radiation zone (%.2f mR/hr). Stopping exploration, yielding to recovery node.",
+      "Robot in ACUTE radiation zone (%.2f mR/hr). Stopping exploration, yielding to recovery node.",
       current_radiation_rate_);
     is_recovering_ = true;
     stop(false);
@@ -659,6 +668,7 @@ void Explore::makePlan()
     search_yaw = last_trajectory_yaw_;
   }
 
+  double remaining_dose_budget = std::max(0.0, max_radiation_dose_ - cumulative_dose_);
   auto frontiers = search_.searchFrom(
     pose.position, search_yaw, latest_battery_state_,
     initial_pose_.position, energy_per_meter_,
@@ -666,7 +676,8 @@ void Explore::makePlan()
     min_frontier_clearance_, latest_heatmap_,
     radiation_scale_, radiation_gradient_scale_,
     critical_dose_mrem_hr_, explored_grid_,
-    goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point());
+    goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point(),
+    remaining_dose_budget, dose_budget_scale_);
 
   // In radiation-seeking mode, re-sort frontiers to prefer those nearest to
   // high-radiation areas, turning the normal cost penalty into a reward.

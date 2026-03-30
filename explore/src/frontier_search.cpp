@@ -43,7 +43,9 @@ FrontierSearch::searchFrom(
   double radiation_gradient_scale,
   double critical_dose_mrem_hr,
   const cv::Mat & explored_grid,
-  const geometry_msgs::msg::Point & current_goal)
+  const geometry_msgs::msg::Point & current_goal,
+  double remaining_dose_budget,
+  double dose_budget_scale)
 {
   std::vector<Frontier> frontier_list;
 
@@ -135,7 +137,8 @@ FrontierSearch::searchFrom(
       frontier, robot_yaw, battery_state, position, home_pos,
       energy_per_meter, battery_safety_margin, battery_penalty_scale,
       heatmap, radiation_scale, radiation_gradient_scale,
-      critical_dose_mrem_hr, explored_grid, current_goal);
+      critical_dose_mrem_hr, explored_grid, current_goal,
+      remaining_dose_budget, dose_budget_scale);
   }
   std::sort(
     frontier_list.begin(), frontier_list.end(),
@@ -299,7 +302,9 @@ double FrontierSearch::frontierCost(
   double radiation_gradient_scale,
   double critical_dose_mrem_hr,
   const cv::Mat & explored_grid,
-  const geometry_msgs::msg::Point & current_goal)
+  const geometry_msgs::msg::Point & current_goal,
+  double remaining_dose_budget,
+  double dose_budget_scale)
 {
   frontier.info_gain = 0.0;
   // Feasibility Check
@@ -365,6 +370,7 @@ double FrontierSearch::frontierCost(
   // Radiation-informed Cost (Request 1)
   // Compute worldToMap for centroid once and reuse for both the critical-dose
   // check and the radiation cost calculation below.
+  double radiation_at_centroid = 0.0;
   double rad_cost = 0;
   if (!heatmap.empty()) {
     unsigned int mx, my;
@@ -397,6 +403,7 @@ double FrontierSearch::frontierCost(
         // Map h_y (bottom-up) to row index (top-down)
         int row = (heatmap.rows - 1) - h_y;
         float radiation = heatmap.at<float>(row, h_x);
+        radiation_at_centroid = static_cast<double>(radiation);
 
         // If radiation exceeds critical threshold, this frontier is lethal/invalid
         if (radiation >= critical_dose_mrem_hr) {
@@ -437,6 +444,22 @@ double FrontierSearch::frontierCost(
           }
         }
       }
+    }
+  }
+
+  // Dose-budget feasibility and efficiency cost.
+  // A frontier is infeasible if the estimated transit dose would exceed the remaining budget.
+  // This lets the robot re-enter previously evacuated areas when budget still permits.
+  double dose_budget_cost = 0.0;
+  if (remaining_dose_budget < std::numeric_limits<double>::infinity()) {
+    constexpr double robot_speed_mps = 0.5;  // conservative estimate
+    double transit_time_hr = (frontier.min_distance / robot_speed_mps) / 3600.0;
+    double expected_transit_dose = radiation_at_centroid * transit_time_hr;
+    if (expected_transit_dose > remaining_dose_budget) {
+      return std::numeric_limits<double>::infinity();
+    }
+    if (remaining_dose_budget > 0.0 && expected_transit_dose > 0.0) {
+      dose_budget_cost = dose_budget_scale * (expected_transit_dose / remaining_dose_budget);
     }
   }
 
@@ -485,7 +508,7 @@ double FrontierSearch::frontierCost(
     }
   }
 
-  return original_cost + info_gain_cost + rad_cost + orientation_penalty + battery_penalty +
-         hysteresis_bonus;
+  return original_cost + info_gain_cost + rad_cost + dose_budget_cost + orientation_penalty +
+         battery_penalty + hysteresis_bonus;
 }
 }  // namespace frontier_exploration
