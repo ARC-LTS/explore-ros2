@@ -229,7 +229,9 @@ private:
     double max_radiation_dose_;
     double radiation_scale_;
     double radiation_gradient_scale_;
-    double critical_dose_mrem_hr_;
+    double critical_dose_mrem_hr_;     // cost-function penalty threshold
+    double acute_dose_rate_mrem_hr_;   // hard stop: triggers evacuation + blacklist
+    double dose_budget_scale_;
     double safe_dose_threshold_mrem_hr_;
     double current_radiation_rate_ = 0.0;
     bool is_recovering_ = false;

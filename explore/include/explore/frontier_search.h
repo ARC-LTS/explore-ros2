@@ -3,6 +3,7 @@
 
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
+#include <limits>
 #include <opencv2/opencv.hpp>
 
 namespace frontier_exploration
@@ -61,7 +62,9 @@ public:
       double radiation_gradient_scale = 0.0,
       double critical_dose_mrem_hr = 2.0,
       const cv::Mat & explored_grid = cv::Mat(),
-      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point());
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
+      double remaining_dose_budget = std::numeric_limits<double>::infinity(),
+      double dose_budget_scale = 10.0);
 
 protected:
     /**
@@ -113,7 +116,9 @@ protected:
       double radiation_gradient_scale = 0.0,
       double critical_dose_mrem_hr = 2.0,
       const cv::Mat & explored_grid = cv::Mat(),
-      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point());
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
+      double remaining_dose_budget = std::numeric_limits<double>::infinity(),
+      double dose_budget_scale = 10.0);
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;
