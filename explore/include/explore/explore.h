@@ -238,6 +238,7 @@ private:
 
     // Explored area tracking
     cv::Mat explored_grid_;
+    int explored_count_ = 0;
     void updateExploredArea();
 
     // verification parameters

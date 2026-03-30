@@ -322,56 +322,74 @@ double FrontierSearch::frontierCost(
     (gain_scale_ * frontier.size * costmap_->getResolution());
 
   // Raycasting-based Information Gain (Request 2)
+  // Uses incremental integer cell stepping to avoid worldToMap() on every inner
+  // loop iteration — replaces ~3600 FP divisions with simple integer arithmetic.
   double info_gain_cost = 0;
-  if (!explored_grid.empty()) {
+  if (!explored_grid.empty() && gain_scale_ != 0.0) {
     int unknown_cells_visible = 0;
-    double angle_step = 2.0 * M_PI / 36.0; // 10 degree steps for efficiency
-    double range = 5.0; // Visibility range from frontier
+    constexpr int N_RAYS = 36;
+    constexpr double ANGLE_STEP = 2.0 * M_PI / N_RAYS;
+    double range = 5.0;
     double res = costmap_->getResolution();
+    int n_steps = static_cast<int>(range / res);
 
-    for (double a = 0; a < 2.0 * M_PI; a += angle_step) {
-      for (double r = 0; r < range; r += res) {
-        double wx = frontier.centroid.x + r * cos(a);
-        double wy = frontier.centroid.y + r * sin(a);
-        unsigned int rmx, rmy;
-        if (costmap_->worldToMap(wx, wy, rmx, rmy)) {
-          if (costmap_->getCost(rmx, rmy) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
-            break;
-          }
+    unsigned int cx_start, cy_start;
+    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, cx_start, cy_start)) {
+      double fstart_x = static_cast<double>(cx_start) + 0.5;
+      double fstart_y = static_cast<double>(cy_start) + 0.5;
+
+      for (int ai = 0; ai < N_RAYS; ai++) {
+        double a = ai * ANGLE_STEP;
+        double dca = std::cos(a);
+        double dsa = std::sin(a);
+        double fcx = fstart_x;
+        double fcy = fstart_y;
+
+        for (int k = 0; k < n_steps; k++) {
+          fcx += dca;
+          fcy += dsa;
+          int rmx = static_cast<int>(fcx);
+          int rmy = static_cast<int>(fcy);
+          if (rmx < 0 || rmx >= (int)size_x_ || rmy < 0 || rmy >= (int)size_y_) {break;}
+          if (map_[rmy * size_x_ + rmx] >= nav2_costmap_2d::LETHAL_OBSTACLE) {break;}
           if (explored_grid.at<uchar>(rmy, rmx) == 0) {
             unknown_cells_visible++;
           }
-        } else {
-          break;
         }
       }
     }
-    // Store gain for visualization
     frontier.info_gain = unknown_cells_visible * res * res;
-    // Subtract from cost (higher gain = lower cost)
     info_gain_cost = -gain_scale_ * unknown_cells_visible * res;
   }
 
   // Radiation-informed Cost (Request 1)
+  // Compute worldToMap for centroid once and reuse for both the critical-dose
+  // check and the radiation cost calculation below.
   double rad_cost = 0;
   if (!heatmap.empty()) {
     unsigned int mx, my;
-    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
+    // Check critical dose at centroid (computed once, reused below)
+    bool centroid_in_map = costmap_->worldToMap(
+      frontier.centroid.x, frontier.centroid.y, mx, my);
+    if (centroid_in_map) {
       int row = (heatmap.rows - 1) - my;
       if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
         float radiation = heatmap.at<float>(row, mx);
         if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
       }
     }
-    if (costmap_->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
-      int row = (heatmap.rows - 1) - my;
-      if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
-        float radiation = heatmap.at<float>(row, mx);
-        if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+    {
+      unsigned int mmx, mmy;
+      if (costmap_->worldToMap(frontier.middle.x, frontier.middle.y, mmx, mmy)) {
+        int row = (heatmap.rows - 1) - mmy;
+        if (mmx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
+          float radiation = heatmap.at<float>(row, mmx);
+          if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+        }
       }
     }
 
-    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
+    if (centroid_in_map) {
       int h_x = mx;
       int h_y = my;
 
