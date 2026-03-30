@@ -369,13 +369,15 @@ void Explore::updateExploredArea()
   nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
   if (!costmap) {return;}
 
+  unsigned int map_w = costmap->getSizeInCellsX();
+  unsigned int map_h = costmap->getSizeInCellsY();
+
   if (explored_grid_.empty() ||
-    explored_grid_.cols != (int)costmap->getSizeInCellsX() ||
-    explored_grid_.rows != (int)costmap->getSizeInCellsY())
+    explored_grid_.cols != (int)map_w ||
+    explored_grid_.rows != (int)map_h)
   {
-    explored_grid_ = cv::Mat(
-      costmap->getSizeInCellsY(),
-      costmap->getSizeInCellsX(), CV_8UC1, cv::Scalar(0));
+    explored_grid_ = cv::Mat(map_h, map_w, CV_8UC1, cv::Scalar(0));
+    explored_count_ = 0;
   }
 
   geometry_msgs::msg::PoseStamped pose_stamped;
@@ -383,39 +385,58 @@ void Explore::updateExploredArea()
     return;
   }
   auto pose = pose_stamped.pose;
-  unsigned int mx, my;
-  if (!costmap->worldToMap(pose.position.x, pose.position.y, mx, my)) {
+  unsigned int robot_mx, robot_my;
+  if (!costmap->worldToMap(pose.position.x, pose.position.y, robot_mx, robot_my)) {
     return;
   }
 
-  // Simple raycasting to update explored area
-  double angle_step = 2.0 * M_PI / 360.0; // 1 degree steps
-  double range = 10.0; // Max range for exploration measurement
+  // Raycasting to update explored area.
+  // Uses 180 angles (2° steps) and incremental integer cell stepping to avoid
+  // calling worldToMap() ~200 times per ray — a ~20x reduction vs. the original.
+  constexpr int N_ANGLES = 180;
+  constexpr double ANGLE_STEP = 2.0 * M_PI / N_ANGLES;
+  double range = 10.0;
   double res = costmap->getResolution();
+  int n_steps = static_cast<int>(range / res);
 
-  for (double a = 0; a < 2.0 * M_PI; a += angle_step) {
-    for (double r = 0; r < range; r += res) {
-      double wx = pose.position.x + r * cos(a);
-      double wy = pose.position.y + r * sin(a);
-      unsigned int rmx, rmy;
-      if (costmap->worldToMap(wx, wy, rmx, rmy)) {
-        if (costmap->getCost(rmx, rmy) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
-          explored_grid_.at<uchar>(rmy, rmx) = 255;
-          break; // Hit obstacle
-        }
-        explored_grid_.at<uchar>(rmy, rmx) = 255;
-      } else {
-        break; // Out of map
+  // Precompute trig table once per call
+  double cos_t[N_ANGLES], sin_t[N_ANGLES];
+  for (int i = 0; i < N_ANGLES; i++) {
+    cos_t[i] = std::cos(i * ANGLE_STEP);
+    sin_t[i] = std::sin(i * ANGLE_STEP);
+  }
+
+  const unsigned char * map_data = costmap->getCharMap();
+  double start_cx = static_cast<double>(robot_mx) + 0.5;
+  double start_cy = static_cast<double>(robot_my) + 0.5;
+
+  for (int ai = 0; ai < N_ANGLES; ai++) {
+    double dcx = cos_t[ai];
+    double dcy = sin_t[ai];
+    double fcx = start_cx;
+    double fcy = start_cy;
+
+    for (int k = 0; k < n_steps; k++) {
+      fcx += dcx;
+      fcy += dcy;
+      int rmx = static_cast<int>(fcx);
+      int rmy = static_cast<int>(fcy);
+      if (rmx < 0 || rmx >= (int)map_w || rmy < 0 || rmy >= (int)map_h) {
+        break;
       }
+      uchar & cell = explored_grid_.at<uchar>(rmy, rmx);
+      if (map_data[rmy * map_w + rmx] >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+        if (cell == 0) { cell = 255; explored_count_++; }
+        break;
+      }
+      if (cell == 0) { cell = 255; explored_count_++; }
     }
   }
 
-  // Calculate and log explored area
-  int explored_count = cv::countNonZero(explored_grid_);
-  double area = explored_count * res * res;
+  double area = explored_count_ * res * res;
   RCLCPP_INFO_THROTTLE(
     logger_, *this->get_clock(), 5000,
-    "Explored Area: %.2f m^2 (%d cells)", area, explored_count);
+    "Explored Area: %.2f m^2 (%d cells)", area, explored_count_);
 
   // Publish the explored area map for visualization
   if (visualize_ && explored_area_publisher_) {
