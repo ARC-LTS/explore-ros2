@@ -2,7 +2,7 @@
 
 ROS 2 port of [m-explore](https://github.com/hrnr/m-explore) extended with radiation-aware and battery-aware autonomous exploration for hazardous environment robotics. This fork is maintained as a component of the RaMonES (Radiation Monitoring and Exploration System) stack.
 
-Tested on Eloquent, Dashing, Foxy, and Galactic distros.
+Tested on Humble, though should work for Foxy as well.
 
 ---
 
