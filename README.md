@@ -1,153 +1,292 @@
-# m-explore ROS2 port
+# explore-ros2 — Radiation-Aware Frontier Exploration
 
-ROS2 package port for multi-robot autonomous exploration of [m-explore](https://github.com/hrnr/m-explore). Currently tested on Eloquent, Dashing, Foxy, and Galactic distros.
+ROS 2 port of [m-explore](https://github.com/hrnr/m-explore) extended with radiation-aware and battery-aware autonomous exploration for hazardous environment robotics. This fork is maintained as a component of the RaMonES (Radiation Monitoring and Exploration System) stack.
 
-### Contents
-1. [Autonomous exploration](#Autonomous-exploration)
-    * [Demo in simulation with a TB3 robot](#Simulation-with-a-TB3-robot)    
-    * [Demo with a JetBot](#On-a-JetBot-with-realsense-cameras)
-    * [Instructions for the simulation demo](#Running-the-explore-demo-with-TB3)    
-2. [Multirobot map merge](#Multirobot-map-merge)
-    * [Simulation demo with known initial poses](#Known-initial-poses)
-    * [Simulation demo with unknown initial poses](#Unknown-initial-poses)
-    * [ROS2 requirements](#ROS2-requirements)
-    * [Instructions for simulation demos](#Running-the-demo-with-TB3)
+Tested on Eloquent, Dashing, Foxy, and Galactic distros.
 
-## Autonomous exploration
+---
 
-### Simulation with a TB3 robot
-https://user-images.githubusercontent.com/8033598/128805356-be90a880-16c6-4fc9-8f54-e3302873dc8c.mp4
+## Contents
 
+1. [Packages](#packages)
+2. [Changes from upstream](#changes-from-upstream)
+   - [Radiation-aware exploration](#radiation-aware-exploration)
+   - [Battery-aware navigation](#battery-aware-navigation)
+   - [Dijkstra-based path distance](#dijkstra-based-path-distance)
+   - [Enhanced goal management](#enhanced-goal-management)
+   - [Service-based control API](#service-based-control-api)
+   - [Visualization enhancements](#visualization-enhancements)
+   - [Verification and recovery](#verification-and-recovery)
+3. [Parameters reference](#parameters-reference)
+4. [Building](#building)
+5. [Running](#running)
+6. [Multirobot map merge](#multirobot-map-merge)
 
-### On a JetBot with realsense cameras
-https://user-images.githubusercontent.com/18732666/128493567-6841dde0-2250-4d81-9bcb-8b216e0fb34d.mp4
+---
 
+## Packages
 
-Installing
-----------
+| Package | Description |
+|---|---|
+| `explore_lite` | Greedy frontier-based exploration node with radiation and battery awareness |
+| `multirobot_map_merge` | Merges occupancy maps from multiple robots into a single global map |
 
-No binaries yet.
+---
 
-Building
---------
+## Changes from upstream
 
-Build as a standard colcon package. There are no special dependencies needed
-(use rosdep to resolve dependencies in ROS). 
+The upstream m-explore-ros2 port provides a standard greedy frontier exploration algorithm. This fork introduces substantial modifications to support autonomous operation in radiation-contaminated environments.
 
-RUNNING
--------
-To run with a params file just run it with
+### Radiation-aware exploration
+
+The frontier cost function now incorporates radiation data from a heatmap topic (`/rad_heatmap/raw_mean_map`). Each frontier candidate is penalized according to the estimated radiation dose it would expose the robot to, discouraging navigation toward high-dose zones.
+
+**Cumulative dose tracking** integrates the dose rate over time. When the accumulated dose approaches `max_radiation_dose`, the robot initiates a return-to-origin sequence.
+
+**Acute dose rate evacuation** provides a fast-path safety response: if the instantaneous dose rate exceeds `acute_dose_rate_mrem_hr` (default 10 mR/hr), exploration is immediately interrupted and the robot retreats.
+
+**Radiation-seeking mode** inverts the cost penalty so that frontiers near higher radiation gradients are prioritized. This is useful for locating and characterizing radiation sources. The mode is toggled at runtime via a service call (see [Service-based control API](#service-based-control-api)).
+
+Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `radiation_topic` | `rad` | Topic for instantaneous dose rate readings |
+| `heatmap_topic` | `/rad_heatmap/raw_mean_map` | GP heatmap image used for frontier cost |
+| `max_radiation_dose` | `100.0` mR | Cumulative dose limit triggering return |
+| `critical_dose_mrem_hr` | `2.0` mR/hr | Dose rate at which frontier cost penalty activates |
+| `acute_dose_rate_mrem_hr` | `10.0` mR/hr | Dose rate triggering immediate evacuation |
+| `dose_budget_scale` | `10.0` | Weight of dose budget penalty in cost function |
+| `safe_dose_threshold_mrem_hr` | `1.0` mR/hr | Dose rate below which an area is considered safe |
+| `radiation_scale` | `1.0` | Multiplier on heatmap-derived cost contribution |
+| `radiation_gradient_scale` | `1.0` | Multiplier on gradient-based cost contribution |
+
+---
+
+### Battery-aware navigation
+
+The node subscribes to a `sensor_msgs/BatteryState` topic and estimates whether the robot has sufficient charge to reach each frontier candidate and return to the origin. Frontiers that are estimated to drain the battery beyond `min_battery_percentage` are penalized in the cost function.
+
+When the battery state reaches the threshold, the node stops exploration and autonomously returns to the initial pose.
+
+Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `battery_topic` | `/battery_state` | Battery state topic |
+| `energy_per_meter` | `0.1` | Estimated energy consumed per metre of travel |
+| `battery_safety_margin` | `0.1` | Reserve fraction kept for the return trip |
+| `battery_penalty_scale` | `1.0` | Weight of battery penalty in cost function |
+| `min_battery_percentage` | `0.2` | Battery fraction below which return is triggered |
+| `max_battery_used` | `0.8` | Maximum allowable fraction of total charge used |
+
+---
+
+### Dijkstra-based path distance
+
+Upstream `FrontierSearch` ranked frontiers using straight-line (Euclidean) distance, which ignores obstacles and narrow passages. This fork replaces that with an 8-connected Dijkstra search over the costmap, computing actual traversal cost to each frontier centroid. Diagonal steps are weighted by `√2`. This produces more accurate rankings in cluttered environments and prevents the robot from repeatedly targeting frontiers that are geometrically close but navigationally distant.
+
+---
+
+### Enhanced goal management
+
+**Hysteresis bonus**: the current navigation goal receives a cost reduction proportional to `gain_scale`. This prevents thrashing when two frontiers have similar scores and reduces unnecessary goal switches.
+
+**Goal queuing**: the node builds an ordered queue of frontier goals and steps through it on failure or goal completion, avoiding repeated re-computation of the full frontier set for every navigation step.
+
+**Replanning threshold**: if the robot is already within `min_goal_distance_for_replanning` metres of the current goal, no new goal is dispatched. This prevents micro-replanning oscillations.
+
+**Goal blacklisting**: goals that the navigation stack consistently fails to reach are blacklisted and removed from future consideration.
+
+Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `min_goal_distance_for_replanning` | `0.75` m | Distance below which replanning is suppressed |
+| `progress_timeout` | `30.0` s | Time without progress before goal is abandoned |
+| `no_frontier_retry` | `3` | Consecutive no-frontier cycles before finishing |
+
+---
+
+### Service-based control API
+
+In addition to the upstream `explore/resume` topic, this fork exposes three services for programmatic control:
+
+| Service | Type | Description |
+|---|---|---|
+| `~/start` | `std_srvs/Trigger` | Start or resume frontier exploration |
+| `~/stop` | `std_srvs/Trigger` | Pause exploration and cancel current navigation goal |
+| `~/return_to_initial_pose` | `std_srvs/Trigger` | Navigate back to the pose recorded at startup |
+| `~/set_radiation_seeking` | `std_srvs/SetBool` | Enable (`true`) or disable (`false`) radiation-seeking mode |
+
+The `~/mode` topic publishes the current exploration state as a `std_msgs/String` (`exploring`, `returning`, `stopped`, etc.).
+
+---
+
+### Visualization enhancements
+
+- **Frontier markers** (`explore/frontiers`): each frontier is rendered as a colored marker. The colour reflects the frontier's computed cost, allowing operators to inspect the cost function directly in RViz2.
+- **Explored area grid** (`explore/explored_area`): publishes a binary occupancy grid highlighting cells confirmed as traversed.
+- **Heatmap overlay**: when `heatmap_topic` is configured, radiation intensity is overlaid on the frontier marker colours.
+
+---
+
+### Verification and recovery
+
+Before marking an area as fully explored, the node runs up to `max_verification_attempts` navigation attempts to frontiers in the region. This reduces premature termination due to transient navigation failures. After exhausting verification attempts, the frontier is blacklisted.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_verification_attempts` | `5` | Attempts before a frontier is blacklisted |
+| `return_to_init` | `true` | Return to start pose when exploration completes |
+| `auto_start` | `false` | Begin exploring immediately on node startup |
+
+---
+
+## Parameters reference
+
+All parameters are set in `explore/config/params.yaml`. The full set:
+
+```yaml
+explore:
+  ros__parameters:
+    # Frame and topic configuration
+    robot_base_frame: base_link
+    costmap_topic: /global_costmap/costmap
+    costmap_updates_topic: /global_costmap/costmap_updates
+
+    # Frontier cost weights
+    potential_scale: 10.0
+    orientation_scale: 2.0
+    gain_scale: 5.0
+    min_frontier_size: 0.25
+    min_frontier_clearance: 0.0
+
+    # Planner
+    planner_frequency: 1.0
+    progress_timeout: 30.0
+    min_goal_distance_for_replanning: 0.75
+    no_frontier_retry: 3
+
+    # Battery
+    battery_topic: /battery_state
+    energy_per_meter: 0.1
+    battery_safety_margin: 0.1
+    battery_penalty_scale: 1.0
+    min_battery_percentage: 0.2
+    max_battery_used: 0.8
+
+    # Radiation
+    radiation_topic: rad
+    heatmap_topic: /rad_heatmap/raw_mean_map
+    max_radiation_dose: 100.0
+    critical_dose_mrem_hr: 2.0
+    acute_dose_rate_mrem_hr: 10.0
+    dose_budget_scale: 10.0
+    safe_dose_threshold_mrem_hr: 1.0
+    radiation_scale: 1.0
+    radiation_gradient_scale: 1.0
+
+    # Verification and control
+    max_verification_attempts: 5
+    return_to_init: true
+    auto_start: false
+    visualize: true
 ```
-ros2 run explore_lite explore --ros-args --params-file <path_to_ros_ws>/m-explore-ros2/explore/config/params.yaml
+
+---
+
+## Building
+
+Build as a standard colcon package. Use rosdep to resolve dependencies:
+
+```bash
+cd <ros2_ws>
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --packages-select explore_lite multirobot_map_merge
 ```
 
-### Running the explore demo with TB3
-Install nav2 and tb3 simulation. You can follow the [tutorial](https://navigation.ros.org/getting_started/index.html#installation).
+---
 
-Then just run the nav2 stack with slam:
+## Running
 
-```
-export TURTLEBOT3_MODEL=waffle
-export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
-ros2 launch nav2_bringup tb3_simulation_launch.py slam:=True
+### With the RaMonES stack
+
+The recommended way to run this package is via the `rad_launch` orchestration launch file, which starts the full simulation, SLAM, Nav2, radiation heatmapping, and exploration stack in the correct order:
+
+```bash
+ros2 launch rad_launch rad_launch_sim_launch.py
 ```
 
-And run this package with
-```
+The `explore_lite` node starts 25 seconds into the sequence, after Nav2 and the GP heatmap pipeline have initialised.
+
+### Standalone
+
+```bash
 ros2 launch explore_lite explore.launch.py
 ```
 
-You can open rviz2 and add the exploration frontiers marker (topic is `explore/frontiers`) to see the algorithm working and the frontier chosen to explore.
+Or with an explicit params file:
 
-### Additional features
-#### Stop/Resume exploration
-By default the exploration node will start right away the frontier-based exploration algorithm. Alternatively, you can stop the exploration by publishing to a `False` to `explore/resume` topic. This will stop the exploration and the robot will stop moving. You can resume the exploration by publishing to `True` to `explore/resume`.
-
-#### Returning to initial pose
-The robot will return to its initial pose after exploration if you want by defining the parameter `return_to_init` to `True` when launching the node.
-
-#### TB3 troubleshooting (with foxy)
-If you have trouble with TB3 in simulation, as we did, add these extra steps for configuring it.
-
+```bash
+ros2 run explore_lite explore --ros-args --params-file <path>/explore/config/params.yaml
 ```
-source /opt/ros/${ROS_DISTRO}/setup.bash
+
+### With Nav2 and SLAM (TB3 demo)
+
+```bash
 export TURTLEBOT3_MODEL=waffle
-sudo rm -rf /opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations
-sudo git clone https://github.com/ROBOTIS-GIT/turtlebot3_simulations /opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations
-export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_simulations/turtlebot3_gazebo/models
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
+ros2 launch nav2_bringup tb3_simulation_launch.py slam:=True
+ros2 launch explore_lite explore.launch.py
 ```
 
-Then you'll be able to run it.
+Add the `explore/frontiers` marker topic in RViz2 to visualise frontier candidates and the cost-weighted selection.
 
-______________________________________________________________________
+---
+
 ## Multirobot map merge
 
-This package works with known and unknown initial poses of the robots. It merges the maps of the robots and publishes the merged map. Some results in simulation are shown below.
+The `multirobot_map_merge` package is a direct ROS 2 port of the upstream m-explore map merging node. No algorithmic changes have been made relative to the upstream port.
 
 ### Known initial poses
 
-This modality gives normally the best results. The original ROS1 code only supports [slam_gmapping](https://github.com/ros-perception/slam_gmapping) type of maps for the merge. The following shows the result with that.
+Produces the best merge quality. Launch the full simulation stack and then:
 
-https://user-images.githubusercontent.com/8033598/144522712-c31fb4bb-bb5a-4859-b3e1-8ad665f80696.mp4
-
-We also support using [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) in a yet [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat). The following demo shows the map merging using the currently supported and most used ROS2-SLAM library.
-
-https://user-images.githubusercontent.com/8033598/170846935-cfae9f3f-5edd-43ea-b993-7b3ba1db921b.mp4
-
-
-### Unknown initial poses 
-It works better if the robots start very close (< 3 meters) to each other so their relative positions can be calculated properly.
-
-https://user-images.githubusercontent.com/8033598/144522696-517d54fd-74d0-4c55-9aca-f1b9679afb3e.mp4
-
-### ROS2 requirements
-
-#### SLAM
-Because of the logic that merges the maps, currently as a straightforward port to ROS2 from the ROS1 version, the SLAM needs to be done using the ROS1 defacto slam option which is [slam_gmapping](https://github.com/ros-perception/slam_gmapping), which hasn't been ported officially to ROS2 yet. There is an unofficial port but it lacks to pass a namespace to its launch file. For that, this repo was tested with one of the authors of this package's [fork](https://github.com/charlielito/slam_gmapping/tree/feature/namespace_launch). You'll need to git clone to your workspace and build it with colcon.
-
-
-```
-cd <your/ros2_ws/src>
-git clone https://github.com/charlielito/slam_gmapping.git --branch feature/namespace_launch
-cd ..
-colcon build --symlink-install --packages-up-to slam_gmapping
+```bash
+ros2 launch multirobot_map_merge map_merge.launch.py known_init_poses:=True
 ```
 
-**Note**: You could use [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) instead but you need to use this [experimental branch](https://github.com/robo-friends/m-explore-ros2/tree/feature/slam_toolbox_compat) which is still under development.
+Initial poses for each robot are set as parameters under `/<robot_ns>/map_merge/init_pose_x`, `init_pose_y`, etc.
 
-#### Nav2 gazebo spawner (deprecated in humble)
-To spawn multiple robots, you need the `nav2_gazebo_spawner` which does not come up with the `nav2-bringup` installation. For that, install it with `sudo apt install ros-${ROS_DISTRO}-nav2-gazebo-spawner`.
-Note that was the case for release previous to `humble` but since `humble` release, this package is deprecated and a gazebo node is used for this. So, if you are using `humble` or newer, you don't need to install it.
+### Unknown initial poses
 
-#### Nav2 config files
-This repo has some config examples and launch files for running this package with 2 TB3 robots and a world with nav2. Nonetheless, they are only compatible with the galactic/humble distros and since some breaking changes were introduced in this distro, if you want to try it with another ros2 distro you'll need to tweak those param files for that nav2's distro version (which shouldn't be hard).
+Works best when robots start within ~3 metres of each other. Uses AKAZE/ORB feature matching on the occupancy grid images to estimate relative transforms:
 
-### Running the demo with TB3
-First, you'll need to launch the whole simulation stack, nav2 stacks and slam stacks per robot. For that just launch::
+```bash
+ros2 launch multirobot_map_merge map_merge.launch.py known_init_poses:=False
 ```
+
+### TB3 multi-robot demo
+
+```bash
 export TURTLEBOT3_MODEL=waffle
-export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/${ROS_DISTRO}/share/turtlebot3_gazebo/models
 ros2 launch multirobot_map_merge multi_tb3_simulation_launch.py slam_gmapping:=True
-```
-Now run the merging node:
-```
 ros2 launch multirobot_map_merge map_merge.launch.py
 ```
 
-By default, the demo runs with known initial poses. You can change that by launching again both launch commands with the flag `known_init_poses:=False`
+Visualise the merged map:
 
-Then you can start moving each robot with its corresponding rviz2 interface by sending nav2 goals. To see the map merged just launch rviz2:
+```bash
+rviz2 -d <ros2_ws>/src/explore-ros2/map_merge/launch/map_merge.rviz
 ```
-rviz2 -d <your/ros2_ws>/src/m-explore-ros2/map_merge/launch/map_merge.rviz
-```
 
-**Note**: If you want to use slam_toolbox, launch `multirobot_map_merge` with the following flag instead: `slam_toolbox:=True`. Remember to use the experimental branch mentioned above.
+---
 
-WIKI
-----
-No wiki yet.
+## License
 
-COPYRIGHT
----------
+Packages are licensed under the BSD license. See respective package files for details.
 
-Packages are licensed under BSD license. See respective files for details.
+Original m-explore authors: Jiri Horner et al.  
+ROS 2 port authors: Carlos Alvarez, Juan Galvis.  
+Radiation and battery extensions: RaMonES project contributors (Brendon Cintas, Florida International University).
