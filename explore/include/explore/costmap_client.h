@@ -66,9 +66,10 @@ public:
     Costmap2DClient(rclcpp::Node & node, const tf2_ros::Buffer * tf_listener);
     /**
      * @brief Get the pose of the robot in the global frame of the costmap
-     * @return pose of the robot in the global frame of the costmap
+     * @param pose reference to store the robot pose
+     * @return true if transform succeeded, false otherwise
      */
-    geometry_msgs::msg::Pose getRobotPose() const;
+    bool getRobotPose(geometry_msgs::msg::PoseStamped & pose) const;
 
     /**
      * @brief Return a pointer to the "master" costmap which receives updates from

@@ -3,6 +3,8 @@
 
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
+#include <limits>
+#include <opencv2/opencv.hpp>
 
 namespace frontier_exploration
 {
@@ -15,6 +17,7 @@ namespace frontier_exploration
     std::uint32_t size;
     double min_distance;
     double cost;
+    double info_gain;
     geometry_msgs::msg::Point initial;
     geometry_msgs::msg::Point centroid;
     geometry_msgs::msg::Point middle;
@@ -53,7 +56,15 @@ public:
       double energy_per_meter,
       double battery_safety_margin,
       double battery_penalty_scale,
-      double min_frontier_clearance = 0.0);
+      double min_frontier_clearance = 0.0,
+      const cv::Mat & heatmap = cv::Mat(),
+      double radiation_scale = 0.0,
+      double radiation_gradient_scale = 0.0,
+      double critical_dose_mrem_hr = 2.0,
+      const cv::Mat & explored_grid = cv::Mat(),
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
+      double remaining_dose_budget = std::numeric_limits<double>::infinity(),
+      double dose_budget_scale = 10.0);
 
 protected:
     /**
@@ -66,9 +77,10 @@ protected:
      * @return new frontier
      */
     Frontier buildNewFrontier(
-      unsigned int initial_cell, unsigned int reference,
+      unsigned int initial_cell,
       std::vector < bool > & frontier_flag,
-      double min_frontier_clearance);
+      double min_frontier_clearance,
+      const std::vector < double > & dist_map);
 
     /**
      * @brief isNewFrontierCell Evaluate if candidate cell is a valid candidate
@@ -91,14 +103,22 @@ protected:
      * @return cost of the frontier
      */
     double frontierCost(
-      const Frontier & frontier,
+      Frontier & frontier,
       double robot_yaw,
       const sensor_msgs::msg::BatteryState & battery_state,
       const geometry_msgs::msg::Point & robot_pos,
       const geometry_msgs::msg::Point & home_pos,
       double energy_per_meter,
       double battery_safety_margin,
-      double battery_penalty_scale);
+      double battery_penalty_scale,
+      const cv::Mat & heatmap = cv::Mat(),
+      double radiation_scale = 0.0,
+      double radiation_gradient_scale = 0.0,
+      double critical_dose_mrem_hr = 2.0,
+      const cv::Mat & explored_grid = cv::Mat(),
+      const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
+      double remaining_dose_budget = std::numeric_limits<double>::infinity(),
+      double dose_budget_scale = 10.0);
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;

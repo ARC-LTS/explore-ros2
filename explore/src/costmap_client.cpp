@@ -234,19 +234,18 @@ void Costmap2DClient::updatePartialMap(
   }
 }
 
-geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
+bool Costmap2DClient::getRobotPose(geometry_msgs::msg::PoseStamped & pose) const
 {
-  geometry_msgs::msg::PoseStamped robot_pose;
-  geometry_msgs::msg::Pose empty_pose;
-  robot_pose.header.frame_id = robot_base_frame_;
-  robot_pose.header.stamp = node_.now();
+  pose.header.frame_id = robot_base_frame_;
+  pose.header.stamp = rclcpp::Time(0, 0, node_.get_clock()->get_clock_type());
+  pose.pose.orientation.w = 1.0; // Default
 
   auto & clk = *node_.get_clock();
 
   // get the global pose of the robot
   try {
-    robot_pose = tf_->transform(
-      robot_pose, global_frame_,
+    pose = tf_->transform(
+      pose, global_frame_,
       tf2::durationFromSec(transform_tolerance_));
   } catch (tf2::LookupException & ex) {
     RCLCPP_ERROR_THROTTLE(
@@ -254,27 +253,27 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
       "No Transform available Error looking up robot pose: "
       "%s\n",
       ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::ConnectivityException & ex) {
     RCLCPP_ERROR_THROTTLE(
       node_.get_logger(), clk, 1000,
       "Connectivity Error looking up robot pose: %s\n",
       ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::ExtrapolationException & ex) {
     RCLCPP_ERROR_THROTTLE(
       node_.get_logger(), clk, 1000,
       "Extrapolation Error looking up robot pose: %s\n",
       ex.what());
-    return empty_pose;
+    return false;
   } catch (tf2::TransformException & ex) {
     RCLCPP_ERROR_THROTTLE(
       node_.get_logger(), clk, 1000, "Other error: %s\n",
       ex.what());
-    return empty_pose;
+    return false;
   }
 
-  return robot_pose.pose;
+  return true;
 }
 
 std::array<unsigned char, 256> init_translation_table()

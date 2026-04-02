@@ -3,6 +3,8 @@
 
 #include <geometry_msgs/msg/point.hpp>
 #include <mutex>
+#include <queue>
+#include <limits>
 
 #include "nav2_costmap_2d/cost_values.hpp"
 
@@ -35,7 +37,15 @@ FrontierSearch::searchFrom(
   double energy_per_meter,
   double battery_safety_margin,
   double battery_penalty_scale,
-  double min_frontier_clearance)
+  double min_frontier_clearance,
+  const cv::Mat & heatmap,
+  double radiation_scale,
+  double radiation_gradient_scale,
+  double critical_dose_mrem_hr,
+  const cv::Mat & explored_grid,
+  const geometry_msgs::msg::Point & current_goal,
+  double remaining_dose_budget,
+  double dose_budget_scale)
 {
   std::vector<Frontier> frontier_list;
 
@@ -59,40 +69,62 @@ FrontierSearch::searchFrom(
   // initialize flag arrays to keep track of visited and frontier cells
   std::vector<bool> frontier_flag(size_x_ * size_y_, false);
   std::vector<bool> visited_flag(size_x_ * size_y_, false);
+  std::vector<double> dist_map(size_x_ * size_y_, std::numeric_limits<double>::infinity());
 
-  // initialize breadth first search
-  std::queue<unsigned int> bfs;
+  // initialize priority queue for Dijkstra
+  typedef std::pair<double, unsigned int> Cell;
+  std::priority_queue<Cell, std::vector<Cell>, std::greater<Cell>> pq;
 
   // find closest traversable cell to start search
   unsigned int clear, pos = costmap_->getIndex(mx, my);
+  unsigned int start_idx;
   if (map_[pos] < LETHAL_OBSTACLE) {
-    bfs.push(pos);
+    start_idx = pos;
   } else if (nearestCell(clear, pos, FREE_SPACE, *costmap_)) {
-    bfs.push(clear);
+    start_idx = clear;
   } else {
-    bfs.push(pos);
-    RCLCPP_WARN(logger_, "[FrontierSearch] Could not find traversable cell to start search from robot position");
+    start_idx = pos;
+    RCLCPP_WARN(
+      logger_,
+      "[FrontierSearch] Could not find traversable cell to start search from robot position");
   }
-  visited_flag[bfs.front()] = true;
 
-  while (!bfs.empty()) {
-    unsigned int idx = bfs.front();
-    bfs.pop();
+  dist_map[start_idx] = 0.0;
+  pq.push({0.0, start_idx});
 
-    // iterate over 4-connected neighbourhood
-    for (unsigned nbr : nhood4(idx, *costmap_)) {
+  double res = costmap_->getResolution();
+  double diag = res * 1.41421356;
+
+  while (!pq.empty()) {
+    Cell current = pq.top();
+    pq.pop();
+    unsigned int idx = current.second;
+    double d = current.first;
+
+    if (d > dist_map[idx]) {continue;}
+    if (visited_flag[idx]) {continue;}
+    visited_flag[idx] = true;
+
+    // iterate over 8-connected neighbourhood for Dijkstra
+    for (unsigned nbr : nhood8(idx, *costmap_)) {
       // add to queue all free, unvisited cells
-      if (map_[nbr] < LETHAL_OBSTACLE && !visited_flag[nbr]) {
-        visited_flag[nbr] = true;
-        bfs.push(nbr);
-        // check if cell is new frontier cell (unvisited, NO_INFORMATION, free
-        // neighbour)
+      if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        unsigned int nx, ny, ix, iy;
+        costmap_->indexToCells(nbr, nx, ny);
+        costmap_->indexToCells(idx, ix, iy);
+        double step = (nx != ix && ny != iy) ? diag : res;
+        double new_dist = d + step;
+
+        if (new_dist < dist_map[nbr]) {
+          dist_map[nbr] = new_dist;
+          pq.push({new_dist, nbr});
+        }
       } else if (isNewFrontierCell(nbr, frontier_flag, min_frontier_clearance)) {
         frontier_flag[nbr] = true;
-        Frontier new_frontier = buildNewFrontier(nbr, pos, frontier_flag, min_frontier_clearance);
-        if (new_frontier.size * costmap_->getResolution() >=
-          min_frontier_size_)
-        {
+        Frontier new_frontier = buildNewFrontier(
+          nbr, frontier_flag, min_frontier_clearance,
+          dist_map);
+        if (new_frontier.size * res >= min_frontier_size_) {
           frontier_list.push_back(new_frontier);
         }
       }
@@ -103,7 +135,10 @@ FrontierSearch::searchFrom(
   for (auto & frontier : frontier_list) {
     frontier.cost = frontierCost(
       frontier, robot_yaw, battery_state, position, home_pos,
-      energy_per_meter, battery_safety_margin, battery_penalty_scale);
+      energy_per_meter, battery_safety_margin, battery_penalty_scale,
+      heatmap, radiation_scale, radiation_gradient_scale,
+      critical_dose_mrem_hr, explored_grid, current_goal,
+      remaining_dose_budget, dose_budget_scale);
   }
   std::sort(
     frontier_list.begin(), frontier_list.end(),
@@ -114,9 +149,9 @@ FrontierSearch::searchFrom(
 
 Frontier FrontierSearch::buildNewFrontier(
   unsigned int initial_cell,
-  unsigned int reference,
   std::vector<bool> & frontier_flag,
-  double min_frontier_clearance)
+  double min_frontier_clearance,
+  const std::vector<double> & dist_map)
 {
   // initialize frontier structure
   Frontier output;
@@ -124,6 +159,24 @@ Frontier FrontierSearch::buildNewFrontier(
   output.centroid.y = 0;
   output.size = 0; // Initialize size to 0, it will be incremented for valid points.
   output.min_distance = std::numeric_limits<double>::infinity();
+
+  double res = costmap_->getResolution();
+  double diag = res * 1.41421356;
+
+  auto get_path_dist = [&](unsigned int cell_idx) -> double {
+      double min_d = std::numeric_limits<double>::infinity();
+      unsigned int cx, cy;
+      costmap_->indexToCells(cell_idx, cx, cy);
+      for (unsigned int n : nhood8(cell_idx, *costmap_)) {
+        if (dist_map[n] < std::numeric_limits<double>::infinity()) {
+          unsigned int nx, ny;
+          costmap_->indexToCells(n, nx, ny);
+          double step = (nx != cx && ny != cy) ? diag : res;
+          min_d = std::min(min_d, dist_map[n] + step);
+        }
+      }
+      return min_d;
+    };
 
   // record initial contact point for frontier
   unsigned int ix, iy;
@@ -135,22 +188,13 @@ Frontier FrontierSearch::buildNewFrontier(
   output.points.push_back(output.initial);
   output.centroid.x = output.initial.x;
   output.centroid.y = output.initial.y;
+  output.min_distance = get_path_dist(initial_cell);
+  output.middle.x = output.initial.x;
+  output.middle.y = output.initial.y;
 
   // push initial gridcell onto queue
   std::queue<unsigned int> bfs;
   bfs.push(initial_cell);
-
-  // cache reference position in world coords
-  unsigned int rx, ry;
-  double reference_x, reference_y;
-  costmap_->indexToCells(reference, rx, ry);
-  costmap_->mapToWorld(rx, ry, reference_x, reference_y);
-
-  output.min_distance = sqrt(
-    pow((double(reference_x) - double(output.initial.x)), 2.0) +
-    pow((double(reference_y) - double(output.initial.y)), 2.0));
-  output.middle.x = output.initial.x;
-  output.middle.y = output.initial.y;
 
   while (!bfs.empty()) {
     unsigned int idx = bfs.front();
@@ -188,11 +232,8 @@ Frontier FrontierSearch::buildNewFrontier(
         output.centroid.x += wx;
         output.centroid.y += wy;
 
-        // determine frontier's distance from robot, going by closest gridcell
-        // to robot
-        double distance = sqrt(
-          pow((double(reference_x) - double(wx)), 2.0) +
-          pow((double(reference_y) - double(wy)), 2.0));
+        // determine frontier's distance from robot, using path distance
+        double distance = get_path_dist(nbr);
         if (distance < output.min_distance) {
           output.min_distance = distance;
           output.middle.x = wx;
@@ -231,16 +272,16 @@ bool FrontierSearch::isNewFrontierCell(
   // frontier cells should have at least one cell in 4-connected neighbourhood
   // that is free and has enough clearance
   for (unsigned int nbr : nhood4(idx, *costmap_)) {
-    if (map_[nbr] < LETHAL_OBSTACLE) {
-        if (min_frontier_clearance <= 0) {
-            return true;
-        }
-        // If clearance is requested, we check if the neighbor's cost is low enough.
-        // A cost of 0 (FREE_SPACE) is the safest.
-        // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles.
-        if (map_[nbr] < 50) {
-            return true;
-        }
+    if (map_[nbr] < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+      if (min_frontier_clearance <= 0) {
+        return true;
+      }
+      // If clearance is requested, we check if the neighbor's cost is low enough.
+      // A cost of 0 (FREE_SPACE) is the safest.
+      // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles while being more tolerant.
+      if (map_[nbr] < 50) {
+        return true;
+      }
     }
   }
 
@@ -248,15 +289,24 @@ bool FrontierSearch::isNewFrontierCell(
 }
 
 double FrontierSearch::frontierCost(
-  const Frontier & frontier,
+  Frontier & frontier,
   double robot_yaw,
   const sensor_msgs::msg::BatteryState & battery_state,
   const geometry_msgs::msg::Point & robot_pos,
   const geometry_msgs::msg::Point & home_pos,
   double energy_per_meter,
   double battery_safety_margin,
-  double battery_penalty_scale)
+  double battery_penalty_scale,
+  const cv::Mat & heatmap,
+  double radiation_scale,
+  double radiation_gradient_scale,
+  double critical_dose_mrem_hr,
+  const cv::Mat & explored_grid,
+  const geometry_msgs::msg::Point & current_goal,
+  double remaining_dose_budget,
+  double dose_budget_scale)
 {
+  frontier.info_gain = 0.0;
   // Feasibility Check
   double dist_to_frontier = frontier.min_distance;
   double dist_to_home =
@@ -272,9 +322,146 @@ double FrontierSearch::frontierCost(
   }
 
   // Original Cost
-  double original_cost = (potential_scale_ * frontier.min_distance *
-    costmap_->getResolution()) -
+  // min_distance is already in meters, removed resolution multiplication.
+  double original_cost = (potential_scale_ * frontier.min_distance) -
     (gain_scale_ * frontier.size * costmap_->getResolution());
+
+  // Raycasting-based Information Gain (Request 2)
+  // Uses incremental integer cell stepping to avoid worldToMap() on every inner
+  // loop iteration — replaces ~3600 FP divisions with simple integer arithmetic.
+  double info_gain_cost = 0;
+  if (!explored_grid.empty() && gain_scale_ != 0.0) {
+    int unknown_cells_visible = 0;
+    constexpr int N_RAYS = 36;
+    constexpr double ANGLE_STEP = 2.0 * M_PI / N_RAYS;
+    double range = 5.0;
+    double res = costmap_->getResolution();
+    int n_steps = static_cast<int>(range / res);
+
+    unsigned int cx_start, cy_start;
+    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, cx_start, cy_start)) {
+      double fstart_x = static_cast<double>(cx_start) + 0.5;
+      double fstart_y = static_cast<double>(cy_start) + 0.5;
+
+      for (int ai = 0; ai < N_RAYS; ai++) {
+        double a = ai * ANGLE_STEP;
+        double dca = std::cos(a);
+        double dsa = std::sin(a);
+        double fcx = fstart_x;
+        double fcy = fstart_y;
+
+        for (int k = 0; k < n_steps; k++) {
+          fcx += dca;
+          fcy += dsa;
+          int rmx = static_cast<int>(fcx);
+          int rmy = static_cast<int>(fcy);
+          if (rmx < 0 || rmx >= (int)size_x_ || rmy < 0 || rmy >= (int)size_y_) {break;}
+          if (map_[rmy * size_x_ + rmx] >= nav2_costmap_2d::LETHAL_OBSTACLE) {break;}
+          if (explored_grid.at<uchar>(rmy, rmx) == 0) {
+            unknown_cells_visible++;
+          }
+        }
+      }
+    }
+    frontier.info_gain = unknown_cells_visible * res * res;
+    info_gain_cost = -gain_scale_ * unknown_cells_visible * res;
+  }
+
+  // Radiation-informed Cost (Request 1)
+  // Compute worldToMap for centroid once and reuse for both the critical-dose
+  // check and the radiation cost calculation below.
+  double radiation_at_centroid = 0.0;
+  double rad_cost = 0;
+  if (!heatmap.empty()) {
+    unsigned int mx, my;
+    // Check critical dose at centroid (computed once, reused below)
+    bool centroid_in_map = costmap_->worldToMap(
+      frontier.centroid.x, frontier.centroid.y, mx, my);
+    if (centroid_in_map) {
+      int row = (heatmap.rows - 1) - my;
+      if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
+        float radiation = heatmap.at<float>(row, mx);
+        if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+      }
+    }
+    {
+      unsigned int mmx, mmy;
+      if (costmap_->worldToMap(frontier.middle.x, frontier.middle.y, mmx, mmy)) {
+        int row = (heatmap.rows - 1) - mmy;
+        if (mmx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
+          float radiation = heatmap.at<float>(row, mmx);
+          if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+        }
+      }
+    }
+
+    if (centroid_in_map) {
+      int h_x = mx;
+      int h_y = my;
+
+      if (h_x >= 0 && h_x < heatmap.cols && h_y >= 0 && h_y < heatmap.rows) {
+        // Map h_y (bottom-up) to row index (top-down)
+        int row = (heatmap.rows - 1) - h_y;
+        float radiation = heatmap.at<float>(row, h_x);
+        radiation_at_centroid = static_cast<double>(radiation);
+
+        // If radiation exceeds critical threshold, this frontier is lethal/invalid
+        if (radiation >= critical_dose_mrem_hr) {
+          return std::numeric_limits<double>::infinity();
+        }
+
+        // Non-linear aggressive penalty (Request 1 refinement)
+        // If radiation is high, the penalty should grow faster than the gain can offset.
+        // Using a squared penalty after a warning threshold.
+        double warning_thresh = 0.25; // Physical threshold for "elevated"
+        if (radiation > warning_thresh) {
+          rad_cost = radiation_scale * std::pow(radiation / warning_thresh, 2.0);
+        } else {
+          rad_cost = radiation_scale * radiation;
+        }
+
+        // Gradient (Request 1)
+        if (radiation_gradient_scale != 0 && h_x > 0 && h_x < heatmap.cols - 1 && h_y > 0 &&
+          h_y < heatmap.rows - 1)
+        {
+          int row = (heatmap.rows - 1) - h_y;
+          float grad_x = (heatmap.at<float>(row, h_x + 1) - heatmap.at<float>(row, h_x - 1)) / 2.0;
+          // Note: In heatmap (top-down), row decreases as y (bottom-up) increases.
+          // d(rad)/dy = d(rad)/d(row) * d(row)/dy = d(rad)/d(row) * (-1)
+          // d(rad)/d(row) is approx (rad(row+1) - rad(row-1)) / 2
+          // So d(rad)/dy is (rad(row-1) - rad(row+1)) / 2
+          float grad_y = (heatmap.at<float>(row - 1, h_x) - heatmap.at<float>(row + 1, h_x)) / 2.0;
+
+          // Vector from robot to frontier
+          double dx = frontier.centroid.x - robot_pos.x;
+          double dy = frontier.centroid.y - robot_pos.y;
+          double d_len = std::sqrt(dx * dx + dy * dy);
+          if (d_len > 0.001) {
+            dx /= d_len;
+            dy /= d_len;
+            // Dot product: preference for moving with/against gradient
+            rad_cost += radiation_gradient_scale * (grad_x * dx + grad_y * dy);
+          }
+        }
+      }
+    }
+  }
+
+  // Dose-budget feasibility and efficiency cost.
+  // A frontier is infeasible if the estimated transit dose would exceed the remaining budget.
+  // This lets the robot re-enter previously evacuated areas when budget still permits.
+  double dose_budget_cost = 0.0;
+  if (remaining_dose_budget < std::numeric_limits<double>::infinity()) {
+    constexpr double robot_speed_mps = 0.5;  // conservative estimate
+    double transit_time_hr = (frontier.min_distance / robot_speed_mps) / 3600.0;
+    double expected_transit_dose = radiation_at_centroid * transit_time_hr;
+    if (expected_transit_dose > remaining_dose_budget) {
+      return std::numeric_limits<double>::infinity();
+    }
+    if (remaining_dose_budget > 0.0 && expected_transit_dose > 0.0) {
+      dose_budget_cost = dose_budget_scale * (expected_transit_dose / remaining_dose_budget);
+    }
+  }
 
   // Orientation Cost (Trajectory/Orientation Awareness)
   // Sharply penalize frontiers that are "behind" the robot to prevent backtracking.
@@ -290,12 +477,12 @@ double FrontierSearch::frontierCost(
   double orientation_penalty = 0;
   if (orientation_scale_ > 0) {
     if (angle_diff > M_PI / 3.0) { // > 60 degrees
-        // Quadratic penalty: grows quickly as we look further behind
-        double normalized_diff = angle_diff / (M_PI / 3.0);
-        orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
+      // Quadratic penalty: grows quickly as we look further behind
+      double normalized_diff = angle_diff / (M_PI / 3.0);
+      orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
     } else {
-        // Light linear penalty for small deviations
-        orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
+      // Light linear penalty for small deviations
+      orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
     }
   }
 
@@ -303,12 +490,25 @@ double FrontierSearch::frontierCost(
   // Only apply a strong penalty if battery is significantly depleted or if we are very far from home.
   double battery_penalty = 0;
   if (battery_penalty_scale > 0) {
-      // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
-      double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
-      double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) * energy_per_meter;
-      battery_penalty = battery_penalty_scale * adjusted_energy_cost;
+    // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
+    double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
+    double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) *
+      energy_per_meter;
+    battery_penalty = battery_penalty_scale * adjusted_energy_cost;
   }
 
-  return original_cost + orientation_penalty + battery_penalty;
+  // Hysteresis Bonus: Give a small discount to the current goal area to avoid oscillations
+  double hysteresis_bonus = 0.0;
+  if (current_goal.x != 0 || current_goal.y != 0) {
+    double dx = frontier.centroid.x - current_goal.x;
+    double dy = frontier.centroid.y - current_goal.y;
+    double dist_to_current_sq = dx * dx + dy * dy;
+    if (dist_to_current_sq < 1.0 * 1.0) { // 1.0m radius
+      hysteresis_bonus = -0.1 * (1.0 - std::sqrt(dist_to_current_sq));
+    }
+  }
+
+  return original_cost + info_gain_cost + rad_cost + dose_budget_cost + orientation_penalty +
+         battery_penalty + hysteresis_bonus;
 }
 }  // namespace frontier_exploration

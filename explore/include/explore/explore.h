@@ -52,12 +52,17 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
-#include <std_srvs/srv/trigger.hpp> // Add this line
+#include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -91,6 +96,7 @@ public:
       rclcpp_action::ClientGoalHandle < nav2_msgs::action::NavigateToPose >;
 
 private:
+    void handleRecovery();
     /**
      * @brief  Make a global plan
      */
@@ -118,6 +124,10 @@ private:
 
     rclcpp::Publisher < visualization_msgs::msg::MarkerArray > ::SharedPtr
     marker_array_publisher_;
+    rclcpp::Publisher < nav_msgs::msg::OccupancyGrid > ::SharedPtr
+    explored_area_publisher_;
+    rclcpp::Publisher < std_msgs::msg::Bool > ::SharedPtr
+    exploration_finished_publisher_;
     rclcpp::Logger logger_;
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
@@ -137,6 +147,9 @@ private:
 
     rclcpp::Subscription < std_msgs::msg::Float64MultiArray > ::SharedPtr radiation_sub_;
     void radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+
+    rclcpp::Subscription < sensor_msgs::msg::Image > ::SharedPtr heatmap_sub_;
+    void heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg);
 
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
@@ -160,6 +173,8 @@ private:
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr stop_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr return_to_initial_pose_service_;
+    rclcpp::Service < std_srvs::srv::SetBool > ::SharedPtr radiation_seeking_service_;
+    rclcpp::Publisher < std_msgs::msg::String > ::SharedPtr mode_publisher_;
 
     bool startExplorationServiceCallback(
       const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
@@ -170,6 +185,9 @@ private:
     bool returnToInitialPoseServiceCallback(
       const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
       std::shared_ptr < std_srvs::srv::Trigger::Response > response);
+    bool setRadiationSeekingCallback(
+      const std::shared_ptr < std_srvs::srv::SetBool::Request > request,
+      std::shared_ptr < std_srvs::srv::SetBool::Response > response);
 
     // parameters
     double planner_frequency_;
@@ -184,13 +202,18 @@ private:
     bool goal_active_ = false;
     bool waiting_for_goal_response_ = false;
     bool exploration_finished_ = false;
+    bool stopped_ = true;
     int no_frontier_count_ = 0;
     rclcpp::Time goal_sent_time_;
 
     // Added for more robust goal management
     geometry_msgs::msg::Point last_sent_goal_position_;
+    geometry_msgs::msg::Point queued_target_;
+    bool has_queued_target_ = false;
     bool last_goal_successful_ = false;
     double min_goal_distance_for_replanning_;
+
+    void sendGoal(const geometry_msgs::msg::Point & target);
 
     // battery-aware parameters
     std::string battery_topic_;
@@ -202,13 +225,30 @@ private:
 
     // radiation parameters
     std::string radiation_topic_;
+    std::string heatmap_topic_;
     double max_radiation_dose_;
+    double radiation_scale_;
+    double radiation_gradient_scale_;
+    double critical_dose_mrem_hr_;     // cost-function penalty threshold
+    double acute_dose_rate_mrem_hr_;   // hard stop: triggers evacuation + blacklist
+    double dose_budget_scale_;
+    double safe_dose_threshold_mrem_hr_;
+    double current_radiation_rate_ = 0.0;
+    bool is_recovering_ = false;
+    bool radiation_seeking_mode_ = false;
+    cv::Mat latest_heatmap_;
+
+    // Explored area tracking
+    cv::Mat explored_grid_;
+    int explored_count_ = 0;
+    void updateExploredArea();
 
     // verification parameters
     int max_verification_attempts_;
 
     void handleExplorationCompletion(bool force_return = false);
     void startVerification();
+    geometry_msgs::msg::Point findSafeViewpoint(const frontier_exploration::Frontier & frontier);
   };
 }  // namespace explore
 
