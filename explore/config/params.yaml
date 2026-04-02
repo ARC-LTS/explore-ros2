@@ -6,13 +6,14 @@
     costmap_topic: /global_costmap/costmap
     costmap_updates_topic: /global_costmap/costmap_updates
     visualize: true
-    planner_frequency: 0.15
+    planner_frequency: 1.0
     progress_timeout: 30.0
-    potential_scale: 0.5
+    potential_scale: 10.0
     orientation_scale: 2.0
-    gain_scale: 1.0
+    gain_scale: 5.0
     transform_tolerance: 0.3
-    min_frontier_size: 1.0
+    min_frontier_size: 0.25
+    min_frontier_clearance: 0.0
     no_frontier_retry: 3
     battery_topic: /battery_state
     energy_per_meter: 0.1
@@ -20,5 +21,13 @@
     battery_penalty_scale: 1.0
     max_battery_used: 0.8
     max_radiation_dose: 100.0
+    critical_dose_mrem_hr: 2.0
+    acute_dose_rate_mrem_hr: 10.0
+    dose_budget_scale: 10.0
+    safe_dose_threshold_mrem_hr: 1.0
+    radiation_topic: rad
+    heatmap_topic: /rad_heatmap/raw_mean_map
+    radiation_scale: 1.0
+    radiation_gradient_scale: 1.0
     max_verification_attempts: 5
     min_goal_distance_for_replanning: 0.75
