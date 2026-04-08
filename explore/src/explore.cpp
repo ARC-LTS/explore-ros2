@@ -664,9 +664,6 @@ void Explore::makePlan()
   updateExploredArea();
   double robot_yaw = tf2::getYaw(pose.orientation);
   double search_yaw = robot_yaw;
-  if (has_last_trajectory_) {
-    search_yaw = last_trajectory_yaw_;
-  }
 
   double remaining_dose_budget = std::max(0.0, max_radiation_dose_ - cumulative_dose_);
   auto frontiers = search_.searchFrom(
@@ -741,6 +738,17 @@ void Explore::makePlan()
     }
 
     found_target = true;
+    // Log why this frontier was chosen so backtracking can be diagnosed in log.out
+    {
+      const auto & f = *frontier_it;
+      double ang = std::atan2(f.centroid.y - pose.position.y, f.centroid.x - pose.position.x) - search_yaw;
+      while (ang > M_PI) { ang -= 2.0 * M_PI; }
+      while (ang < -M_PI) { ang += 2.0 * M_PI; }
+      RCLCPP_INFO(logger_,
+        "Selected frontier: centroid=(%.2f, %.2f) dist=%.2fm angle=%.1fdeg cost=%.2f (robot yaw=%.1fdeg)",
+        f.centroid.x, f.centroid.y, f.min_distance,
+        ang * 180.0 / M_PI, f.cost, search_yaw * 180.0 / M_PI);
+    }
     break;
   }
 
@@ -1077,7 +1085,9 @@ void Explore::resultCallback(
       break;
   }
 
-  // Only trigger a new plan if we aren't already waiting for one or if one hasn't been preemptively sent.
+  // Force a fresh frontier search from the current (arrived) position.
+  // The queued target was computed while the robot was still moving — discard it.
+  has_queued_target_ = false;
   if (!waiting_for_goal_response_ && !stopped_) {
     makePlan();
   }
