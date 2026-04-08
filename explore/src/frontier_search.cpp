@@ -323,8 +323,12 @@ double FrontierSearch::frontierCost(
 
   // Original Cost
   // min_distance is already in meters, removed resolution multiplication.
-  double original_cost = (potential_scale_ * frontier.min_distance) -
-    (gain_scale_ * frontier.size * costmap_->getResolution());
+  // Size-based gain is capped at 25% of distance cost so frontier size can't
+  // override the distance preference.
+  double size_gain = gain_scale_ * frontier.size * costmap_->getResolution();
+  double max_size_gain = potential_scale_ * frontier.min_distance * 0.25;
+  size_gain = std::min(size_gain, max_size_gain);
+  double original_cost = (potential_scale_ * frontier.min_distance) - size_gain;
 
   // Raycasting-based Information Gain (Request 2)
   // Uses incremental integer cell stepping to avoid worldToMap() on every inner
@@ -365,6 +369,12 @@ double FrontierSearch::frontierCost(
     }
     frontier.info_gain = unknown_cells_visible * res * res;
     info_gain_cost = -gain_scale_ * unknown_cells_visible * res;
+
+    // Cap: info gain can offset at most 50% of this frontier's own distance cost.
+    // This ensures distance always dominates — a far high-gain frontier can never
+    // beat a closer frontier purely on information value.
+    double max_info_benefit = potential_scale_ * frontier.min_distance * 0.5;
+    info_gain_cost = std::max(info_gain_cost, -max_info_benefit);
   }
 
   // Radiation-informed Cost (Request 1)
@@ -464,26 +474,28 @@ double FrontierSearch::frontierCost(
   }
 
   // Orientation Cost (Trajectory/Orientation Awareness)
-  // Sharply penalize frontiers that are "behind" the robot to prevent backtracking.
+  // Two-tier priority: every frontier in the forward hemisphere (within ±90° of heading)
+  // ranks ahead of every rear-hemisphere frontier, regardless of distance.
+  // Within each tier, the base cost (distance, gain, etc.) determines ranking.
+  // Rear frontiers are only selected when no forward frontier is reachable.
   double angle_to_frontier = std::atan2(
     frontier.centroid.y - robot_pos.y,
     frontier.centroid.x - robot_pos.x);
-  double angle_diff = std::abs(angle_to_frontier - robot_yaw);
-  // Normalize angle_diff to [0, PI]
+  double angle_diff = angle_to_frontier - robot_yaw;
+  // Normalize angle_diff to [-PI, PI]
   while (angle_diff > M_PI) {angle_diff -= 2.0 * M_PI;}
-  angle_diff = std::abs(angle_diff);
+  while (angle_diff < -M_PI) {angle_diff += 2.0 * M_PI;}
+  angle_diff = std::abs(angle_diff);  // now in [0, PI]
 
-  // Use a quadratic penalty for backtracking beyond a certain threshold (e.g., 60 degrees)
   double orientation_penalty = 0;
-  if (orientation_scale_ > 0) {
-    if (angle_diff > M_PI / 3.0) { // > 60 degrees
-      // Quadratic penalty: grows quickly as we look further behind
-      double normalized_diff = angle_diff / (M_PI / 3.0);
-      orientation_penalty = orientation_scale_ * std::pow(normalized_diff, 2);
-    } else {
-      // Light linear penalty for small deviations
-      orientation_penalty = (orientation_scale_ / 2.0) * (angle_diff / (M_PI / 3.0));
-    }
+  if (angle_diff > M_PI / 2.0) {
+    // Rear hemisphere (>90° from heading): hard tier offset guarantees every forward
+    // frontier ranks first. 1e6 >> any realistic base cost (potential_scale * world_size).
+    orientation_penalty = 1e6;
+  } else if (orientation_scale_ > 0) {
+    // Forward hemisphere: light smooth penalty to mildly prefer straight-ahead.
+    double t = (1.0 - std::cos(angle_diff)) / 2.0;  // 0 at 0°, 0.5 at 90°
+    orientation_penalty = orientation_scale_ * t * t * 4.0;
   }
 
   // Battery Penalty (Safety Awareness)

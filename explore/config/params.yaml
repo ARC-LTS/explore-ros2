@@ -9,7 +9,7 @@
     planner_frequency: 1.0
     progress_timeout: 30.0
     potential_scale: 10.0
-    orientation_scale: 2.0
+    orientation_scale: 6.0
     gain_scale: 5.0
     transform_tolerance: 0.3
     min_frontier_size: 0.25
