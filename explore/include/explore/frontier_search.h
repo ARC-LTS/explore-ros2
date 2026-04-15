@@ -21,6 +21,8 @@ namespace frontier_exploration
     geometry_msgs::msg::Point initial;
     geometry_msgs::msg::Point centroid;
     geometry_msgs::msg::Point middle;
+    double path_heading_x = 0.0;  // unit-vector: initial Dijkstra step direction toward this frontier
+    double path_heading_y = 0.0;
     std::vector < geometry_msgs::msg::Point > points;
   };
 
@@ -80,7 +82,9 @@ protected:
       unsigned int initial_cell,
       std::vector < bool > & frontier_flag,
       double min_frontier_clearance,
-      const std::vector < double > & dist_map);
+      const std::vector < double > & dist_map,
+      const std::vector<float> & init_dx,
+      const std::vector<float> & init_dy);
 
     /**
      * @brief isNewFrontierCell Evaluate if candidate cell is a valid candidate
