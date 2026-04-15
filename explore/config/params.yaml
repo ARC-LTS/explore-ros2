@@ -16,7 +16,8 @@
     min_frontier_clearance: 0.0
     no_frontier_retry: 3
     battery_topic: /battery_state
-    energy_per_meter: 0.1
+    energy_per_meter: 0.000185  # fraction of battery (0-1 scale) per meter; derived from
+                                # Husky A200 specs: 24V 20Ah, ~3hr runtime at 0.5 m/s nav speed
     battery_safety_margin: 0.1
     battery_penalty_scale: 1.0
     max_battery_used: 0.8

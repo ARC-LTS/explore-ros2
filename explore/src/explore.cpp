@@ -706,9 +706,31 @@ void Explore::makePlan()
   geometry_msgs::msg::Point best_target;
   bool found_target = false;
 
+  // Count infeasible frontiers for diagnostics
+  int n_inf_cost = 0;
+  for (const auto & f : frontiers) {
+    if (std::isinf(f.cost)) { n_inf_cost++; }
+  }
+  if (n_inf_cost > 0 && n_inf_cost == static_cast<int>(frontiers.size())) {
+    RCLCPP_WARN(logger_,
+      "All %d frontiers have infinite cost (infeasible). "
+      "Check battery feasibility params: energy_per_meter=%.3f, "
+      "battery_safety_margin=%.3f, battery_pct=%.3f. "
+      "If battery constraints are not needed set energy_per_meter=0.",
+      n_inf_cost, energy_per_meter_, battery_safety_margin_,
+      latest_battery_state_.percentage);
+  }
+
   while (frontier_it != frontiers.end()) {
     const auto & f = *frontier_it;
-    
+
+    // 0. Never navigate to an infeasible frontier — doing so causes immediate
+    //    blacklisting and replanning churn with no forward progress.
+    if (std::isinf(f.cost)) {
+      frontier_it++;
+      continue;
+    }
+
     // 1. Check if centroid is blacklisted
     if (goalOnBlacklist(f.centroid)) {
       frontier_it++;
@@ -716,7 +738,7 @@ void Explore::makePlan()
     }
 
     // 2. Check if we are already pursuing this frontier
-    if (goal_active_ && (same_point(f.centroid, last_sent_goal_position_) || 
+    if (goal_active_ && (same_point(f.centroid, last_sent_goal_position_) ||
                          same_point(f.middle, last_sent_goal_position_))) {
       frontier_it++;
       continue;

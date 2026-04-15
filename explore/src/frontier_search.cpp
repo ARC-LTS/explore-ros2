@@ -70,6 +70,10 @@ FrontierSearch::searchFrom(
   std::vector<bool> frontier_flag(size_x_ * size_y_, false);
   std::vector<bool> visited_flag(size_x_ * size_y_, false);
   std::vector<double> dist_map(size_x_ * size_y_, std::numeric_limits<double>::infinity());
+  // Per-cell initial Dijkstra step direction (unit vector from robot toward each cell).
+  // Propagated outward so every reachable cell knows which first step leads to it.
+  std::vector<float> init_dx(size_x_ * size_y_, 0.0f);
+  std::vector<float> init_dy(size_x_ * size_y_, 0.0f);
 
   // initialize priority queue for Dijkstra
   typedef std::pair<double, unsigned int> Cell;
@@ -88,6 +92,9 @@ FrontierSearch::searchFrom(
       logger_,
       "[FrontierSearch] Could not find traversable cell to start search from robot position");
   }
+
+  unsigned int start_cx, start_cy;
+  costmap_->indexToCells(start_idx, start_cx, start_cy);
 
   dist_map[start_idx] = 0.0;
   pq.push({0.0, start_idx});
@@ -117,13 +124,24 @@ FrontierSearch::searchFrom(
 
         if (new_dist < dist_map[nbr]) {
           dist_map[nbr] = new_dist;
+          // Seed direction from robot on first step; propagate outward unchanged.
+          if (idx == start_idx) {
+            float ddx = static_cast<float>((int)nx - (int)start_cx);
+            float ddy = static_cast<float>((int)ny - (int)start_cy);
+            float len = std::sqrt(ddx * ddx + ddy * ddy);
+            init_dx[nbr] = (len > 0.0f) ? ddx / len : 0.0f;
+            init_dy[nbr] = (len > 0.0f) ? ddy / len : 0.0f;
+          } else {
+            init_dx[nbr] = init_dx[idx];
+            init_dy[nbr] = init_dy[idx];
+          }
           pq.push({new_dist, nbr});
         }
       } else if (isNewFrontierCell(nbr, frontier_flag, min_frontier_clearance)) {
         frontier_flag[nbr] = true;
         Frontier new_frontier = buildNewFrontier(
           nbr, frontier_flag, min_frontier_clearance,
-          dist_map);
+          dist_map, init_dx, init_dy);
         if (new_frontier.size * res >= min_frontier_size_) {
           frontier_list.push_back(new_frontier);
         }
@@ -151,7 +169,9 @@ Frontier FrontierSearch::buildNewFrontier(
   unsigned int initial_cell,
   std::vector<bool> & frontier_flag,
   double min_frontier_clearance,
-  const std::vector<double> & dist_map)
+  const std::vector<double> & dist_map,
+  const std::vector<float> & init_dx,
+  const std::vector<float> & init_dy)
 {
   // initialize frontier structure
   Frontier output;
@@ -159,11 +179,15 @@ Frontier FrontierSearch::buildNewFrontier(
   output.centroid.y = 0;
   output.size = 0; // Initialize size to 0, it will be incremented for valid points.
   output.min_distance = std::numeric_limits<double>::infinity();
+  output.path_heading_x = 0.0;
+  output.path_heading_y = 0.0;
 
   double res = costmap_->getResolution();
   double diag = res * 1.41421356;
 
-  auto get_path_dist = [&](unsigned int cell_idx) -> double {
+  // Returns path distance and sets out_hdx/out_hdy to the initial Dijkstra step
+  // direction (unit vector) that leads toward cell_idx from the robot start.
+  auto get_path_dist = [&](unsigned int cell_idx, double & out_hdx, double & out_hdy) -> double {
       double min_d = std::numeric_limits<double>::infinity();
       unsigned int cx, cy;
       costmap_->indexToCells(cell_idx, cx, cy);
@@ -172,7 +196,12 @@ Frontier FrontierSearch::buildNewFrontier(
           unsigned int nx, ny;
           costmap_->indexToCells(n, nx, ny);
           double step = (nx != cx && ny != cy) ? diag : res;
-          min_d = std::min(min_d, dist_map[n] + step);
+          double d = dist_map[n] + step;
+          if (d < min_d) {
+            min_d = d;
+            out_hdx = static_cast<double>(init_dx[n]);
+            out_hdy = static_cast<double>(init_dy[n]);
+          }
         }
       }
       return min_d;
@@ -188,7 +217,7 @@ Frontier FrontierSearch::buildNewFrontier(
   output.points.push_back(output.initial);
   output.centroid.x = output.initial.x;
   output.centroid.y = output.initial.y;
-  output.min_distance = get_path_dist(initial_cell);
+  output.min_distance = get_path_dist(initial_cell, output.path_heading_x, output.path_heading_y);
   output.middle.x = output.initial.x;
   output.middle.y = output.initial.y;
 
@@ -233,11 +262,14 @@ Frontier FrontierSearch::buildNewFrontier(
         output.centroid.y += wy;
 
         // determine frontier's distance from robot, using path distance
-        double distance = get_path_dist(nbr);
+        double ph_dx = 0.0, ph_dy = 0.0;
+        double distance = get_path_dist(nbr, ph_dx, ph_dy);
         if (distance < output.min_distance) {
           output.min_distance = distance;
           output.middle.x = wx;
           output.middle.y = wy;
+          output.path_heading_x = ph_dx;
+          output.path_heading_y = ph_dy;
         }
 
         // add to queue for breadth first search
@@ -307,7 +339,16 @@ double FrontierSearch::frontierCost(
   double dose_budget_scale)
 {
   frontier.info_gain = 0.0;
-  // Feasibility Check
+  // Battery feasibility check.
+  // Only applied when:
+  //   - energy_per_meter > 0 (battery modelling is enabled)
+  //   - battery percentage is a valid, known value (sensor_msgs/BatteryState uses
+  //     -1.0 for "unknown"; 0.0 may be an uninitialized default before the first
+  //     message arrives, so we also skip the check in that case)
+  //
+  // NOTE on scaling: battery_state.percentage follows the ROS standard (0.0–1.0).
+  // energy_per_meter must be set accordingly — e.g. 0.001 means 0.1 % per meter.
+  // If your battery driver publishes 0–100, divide energy_per_meter by 100.
   double dist_to_frontier = frontier.min_distance;
   double dist_to_home =
     std::sqrt(
@@ -317,7 +358,11 @@ double FrontierSearch::frontierCost(
   double total_dist = dist_to_frontier + dist_to_home;
   double energy_cost = total_dist * energy_per_meter;
 
-  if (energy_cost > battery_state.percentage - battery_safety_margin) {
+  const float batt_pct = battery_state.percentage;
+  const bool batt_valid = (batt_pct > 0.0f);  // skip if unknown (-1) or uninitialized (0)
+  if (energy_per_meter > 0.0 && batt_valid &&
+    energy_cost > static_cast<double>(batt_pct) - battery_safety_margin)
+  {
     return std::numeric_limits<double>::infinity();
   }
 
@@ -478,9 +523,21 @@ double FrontierSearch::frontierCost(
   // ranks ahead of every rear-hemisphere frontier, regardless of distance.
   // Within each tier, the base cost (distance, gain, etc.) determines ranking.
   // Rear frontiers are only selected when no forward frontier is reachable.
-  double angle_to_frontier = std::atan2(
-    frontier.centroid.y - robot_pos.y,
-    frontier.centroid.x - robot_pos.x);
+  // Determine the orientation to this frontier using the actual initial Dijkstra step
+  // direction, which reflects the true first move the robot must make regardless of
+  // where the frontier's centroid or middle point happen to lie geometrically.
+  // This correctly handles warehouse aisles and any environment where obstacles force
+  // the path to initially diverge from the straight-line direction to the frontier.
+  // Falls back to direction-to-middle (closest accessible point) if path heading is
+  // unavailable (e.g. frontier adjacent to robot start).
+  double angle_to_frontier;
+  if (std::abs(frontier.path_heading_x) > 1e-6 || std::abs(frontier.path_heading_y) > 1e-6) {
+    angle_to_frontier = std::atan2(frontier.path_heading_y, frontier.path_heading_x);
+  } else {
+    angle_to_frontier = std::atan2(
+      frontier.middle.y - robot_pos.y,
+      frontier.middle.x - robot_pos.x);
+  }
   double angle_diff = angle_to_frontier - robot_yaw;
   // Normalize angle_diff to [-PI, PI]
   while (angle_diff > M_PI) {angle_diff -= 2.0 * M_PI;}
@@ -499,11 +556,11 @@ double FrontierSearch::frontierCost(
   }
 
   // Battery Penalty (Safety Awareness)
-  // Only apply a strong penalty if battery is significantly depleted or if we are very far from home.
+  // Only apply when battery modelling is enabled and we have a valid reading.
   double battery_penalty = 0;
-  if (battery_penalty_scale > 0) {
+  if (battery_penalty_scale > 0 && energy_per_meter > 0.0 && batt_valid) {
     // Reduce the influence of dist_to_home unless necessary to avoid "magnetic" pull to start point
-    double home_factor = (battery_state.percentage < 0.5) ? 1.0 : 0.2;
+    double home_factor = (batt_pct < 0.5f) ? 1.0 : 0.2;
     double adjusted_energy_cost = (dist_to_frontier + dist_to_home * home_factor) *
       energy_per_meter;
     battery_penalty = battery_penalty_scale * adjusted_energy_cost;
