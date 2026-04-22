@@ -271,6 +271,12 @@ Explore::Explore()
     std::bind(
       &Explore::toggleModeServiceCallback, this, std::placeholders::_1,
       std::placeholders::_2));
+
+  reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+    "~/reset",
+    std::bind(
+      &Explore::resetServiceCallback, this, std::placeholders::_1,
+      std::placeholders::_2));
 }
 
 Explore::~Explore()
@@ -395,6 +401,7 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
           radiation_mode_above_count_ >= radiation_mode_entry_hysteresis_)
       {
         exploration_mode_ = ExplorationMode::RADIATION;
+        radiation_in_boundary_phase_ = false;  // always start with ascent on fresh entry
         std_msgs::msg::String mode_msg;
         mode_msg.data = "radiation_mode";
         mode_publisher_->publish(mode_msg);
@@ -470,6 +477,7 @@ void Explore::stableSourceCallback(const geometry_msgs::msg::PointStamped::Share
   // That means we've adequately characterised this source — switch back to
   // spatial mode so the robot moves on rather than circling the same zone.
   exploration_mode_ = ExplorationMode::SPATIAL;
+  radiation_in_boundary_phase_ = false;
   radiation_mode_above_count_ = 0;  // prevent immediately re-entering RADIATION mode
   recent_rad_buffer_.clear();       // flush the rolling window so exit isn't re-triggered
 
@@ -737,100 +745,186 @@ std::vector<frontier_exploration::Frontier> Explore::generateRadiationFrontiers(
   float gy = grad_y_map.at<float>(robot_row, robot_col);  // +y = south in image (y-flipped)
   float grad_mag = std::sqrt(gx * gx + gy * gy);
 
-  // If the gradient is negligible the robot is already at (or past) the peak.
-  // Return nothing — let the stable-capture machinery handle it.
-  if (grad_mag < 0.02f) {
-    RCLCPP_DEBUG(logger_, "Radiation gradient negligible (%.4f) — near peak, no frontiers.", grad_mag);
-    return {};
-  }
+  // -----------------------------------------------------------------------
+  // Phase 1 — Gradient ascent toward source peak.
+  // Active only while the gradient is significant AND we haven't yet committed
+  // to the boundary survey.  Once the peak is reached (gradient ≈ 0) the robot
+  // enters Phase 2 and never returns here for this radiation event.
+  // -----------------------------------------------------------------------
+  if (!radiation_in_boundary_phase_ && grad_mag >= 0.02f) {
+    float nx =  gx / grad_mag;   // costmap +x (east)
+    float ny = -gy / grad_mag;   // costmap +y (north) — sign flip for row/col inversion
 
-  // Normalised ascent direction in costmap-cell space.
-  // Image col aligns with costmap x, but image row is inverted vs costmap y,
-  // so the world-y component of the gradient needs its sign flipped.
-  float nx =  gx / grad_mag;   // costmap +x (east)
-  float ny = -gy / grad_mag;   // costmap +y (north)  ← sign flip for y
+    RCLCPP_DEBUG(logger_,
+      "Radiation ascent: grad_mag=%.3f  dir=(%.2f, %.2f)", grad_mag, nx, ny);
 
-  RCLCPP_DEBUG(logger_,
-    "Radiation gradient: mag=%.3f  direction=(%.2f, %.2f) in world frame.", grad_mag, nx, ny);
+    const std::vector<double> distances     = {3.0, 6.0};
+    const std::vector<double> angle_offsets = {0.0, M_PI / 6.0, -M_PI / 6.0};
+    std::vector<frontier_exploration::Frontier> candidates;
 
-  // Candidate step distances and angular offsets.
-  // Primary: straight along gradient. Alternatives: ±30° for obstacle avoidance.
-  const std::vector<double> distances    = {3.0, 6.0};
-  const std::vector<double> angle_offsets = {0.0, M_PI / 6.0, -M_PI / 6.0};
+    for (double dist : distances) {
+      int step_cells = static_cast<int>(dist / res);
+      for (double angle_off : angle_offsets) {
+        double rot_nx = nx * std::cos(angle_off) - ny * std::sin(angle_off);
+        double rot_ny = nx * std::sin(angle_off) + ny * std::cos(angle_off);
 
-  std::vector<frontier_exploration::Frontier> candidates;
+        int target_mx = static_cast<int>(robot_mx) + static_cast<int>(rot_nx * step_cells);
+        int target_my = static_cast<int>(robot_my) + static_cast<int>(rot_ny * step_cells);
 
-  for (double dist : distances) {
-    int step_cells = static_cast<int>(dist / res);
+        if (target_mx < 0 || target_mx >= static_cast<int>(costmap->getSizeInCellsX()) ||
+            target_my < 0 || target_my >= static_cast<int>(costmap->getSizeInCellsY())) continue;
+        if (costmap->getCost(target_mx, target_my) >=
+            nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) continue;
 
-    for (double angle_off : angle_offsets) {
-      // Rotate the ascent direction by angle_off
-      double rot_nx = nx * std::cos(angle_off) - ny * std::sin(angle_off);
-      double rot_ny = nx * std::sin(angle_off) + ny * std::cos(angle_off);
+        int t_row = (rows - 1) - target_my;
+        int t_col = target_mx;
+        if (t_row < 0 || t_row >= rows || t_col < 0 || t_col >= cols) continue;
+        float rad_val = latest_heatmap_.at<float>(t_row, t_col);
+        if (rad_val < static_cast<float>(safe_dose_threshold_mrem_hr_)) continue;
 
-      int target_mx = static_cast<int>(robot_mx) + static_cast<int>(rot_nx * step_cells);
-      int target_my = static_cast<int>(robot_my) + static_cast<int>(rot_ny * step_cells);
+        double wx, wy;
+        costmap->mapToWorld(target_mx, target_my, wx, wy);
+        geometry_msgs::msg::Point wp;
+        wp.x = wx; wp.y = wy;
+        if (goalOnBlacklist(wp)) continue;
 
-      if (target_mx < 0 || target_mx >= static_cast<int>(costmap->getSizeInCellsX()) ||
-          target_my < 0 || target_my >= static_cast<int>(costmap->getSizeInCellsY())) continue;
+        double dx = wx - robot_pos.x;
+        double dy = wy - robot_pos.y;
+        double actual_dist = std::sqrt(dx * dx + dy * dy);
+        if (actual_dist < min_goal_distance_for_replanning_) continue;
 
-      if (costmap->getCost(target_mx, target_my) >=
-          nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) continue;
-
-      // Heatmap value at target — must be above threshold (gradient points uphill,
-      // but we confirm the destination is actually in an elevated zone)
-      int t_row = (rows - 1) - target_my;
-      int t_col = target_mx;
-      if (t_row < 0 || t_row >= rows || t_col < 0 || t_col >= cols) continue;
-      float rad_val = latest_heatmap_.at<float>(t_row, t_col);
-      if (rad_val < static_cast<float>(safe_dose_threshold_mrem_hr_)) continue;
-
-      double wx, wy;
-      costmap->mapToWorld(target_mx, target_my, wx, wy);
-
-      geometry_msgs::msg::Point wp;
-      wp.x = wx; wp.y = wy;
-      if (goalOnBlacklist(wp)) continue;
-
-      double dx = wx - robot_pos.x;
-      double dy = wy - robot_pos.y;
-      double actual_dist = std::sqrt(dx * dx + dy * dy);
-      if (actual_dist < min_goal_distance_for_replanning_) continue;
-
-      frontier_exploration::Frontier f;
-      f.centroid     = wp;
-      f.middle       = wp;
-      f.initial      = wp;
-      f.size         = 1;
-      f.info_gain    = static_cast<double>(rad_val);
-      f.min_distance = actual_dist;
-      f.is_radiation = true;
-      f.points.push_back(wp);
-      // Prefer on-axis (angle_off=0) and shorter distance
-      f.cost = actual_dist * (1.0 + std::abs(angle_off) / M_PI);
-
-      candidates.push_back(f);
+        frontier_exploration::Frontier f;
+        f.centroid     = wp;
+        f.middle       = wp;
+        f.initial      = wp;
+        f.size         = 1;
+        f.info_gain    = static_cast<double>(rad_val);
+        f.min_distance = actual_dist;
+        f.is_radiation = true;
+        f.points.push_back(wp);
+        f.cost = actual_dist * (1.0 + std::abs(angle_off) / M_PI);
+        candidates.push_back(f);
+      }
     }
+
+    std::sort(candidates.begin(), candidates.end(),
+      [](const frontier_exploration::Frontier & a, const frontier_exploration::Frontier & b) {
+        return a.cost < b.cost;
+      });
+    std::vector<frontier_exploration::Frontier> result;
+    for (const auto & f : candidates) {
+      bool too_close = false;
+      for (const auto & kept : result) {
+        double ddx = f.centroid.x - kept.centroid.x;
+        double ddy = f.centroid.y - kept.centroid.y;
+        if (ddx * ddx + ddy * ddy < 1.0) { too_close = true; break; }
+      }
+      if (!too_close) result.push_back(f);
+    }
+    RCLCPP_DEBUG(logger_, "Generated %zu ascent frontiers.", result.size());
+    return result;
   }
 
-  // Deduplicate: drop any candidate within 1 m of a cheaper one already kept
-  std::sort(candidates.begin(), candidates.end(),
+  // -----------------------------------------------------------------------
+  // Phase 2 — Boundary survey.
+  // The gradient is negligible (robot is at/near the peak) OR the boundary
+  // survey was already started.  Walk radially outward in N directions to find
+  // where each ray crosses from elevated back to background level.  The robot
+  // visits each edge point in turn; once all are blacklisted the zone is fully
+  // mapped and makePlan() will exit RADIATION mode.
+  // -----------------------------------------------------------------------
+  if (!radiation_in_boundary_phase_) {
+    radiation_in_boundary_phase_ = true;
+    RCLCPP_INFO(logger_,
+      "Radiation source peak reached (gradient=%.4f). Starting boundary survey.", grad_mag);
+  }
+
+  constexpr int    N_SURVEY_DIRS = 8;
+  constexpr double SURVEY_MAX_M  = 15.0;
+  constexpr double SURVEY_STEP_M = 0.5;
+
+  std::vector<frontier_exploration::Frontier> boundary;
+
+  for (int a = 0; a < N_SURVEY_DIRS; a++) {
+    double angle = a * (2.0 * M_PI / N_SURVEY_DIRS);
+    double dir_x = std::cos(angle);
+    double dir_y = std::sin(angle);
+
+    double last_el_x    = robot_pos.x;
+    double last_el_y    = robot_pos.y;
+    bool   started_above = false;
+    bool   found_crossing = false;
+
+    for (double r = SURVEY_STEP_M; r <= SURVEY_MAX_M; r += SURVEY_STEP_M) {
+      double wx = robot_pos.x + r * dir_x;
+      double wy = robot_pos.y + r * dir_y;
+
+      unsigned int mx, my;
+      if (!costmap->worldToMap(wx, wy, mx, my)) break;
+      if (costmap->getCost(mx, my) >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) break;
+
+      int t_row = (rows - 1) - static_cast<int>(my);
+      int t_col = static_cast<int>(mx);
+      if (t_row < 0 || t_row >= rows || t_col < 0 || t_col >= cols) break;
+
+      float val = latest_heatmap_.at<float>(t_row, t_col);
+      if (val >= static_cast<float>(safe_dose_threshold_mrem_hr_)) {
+        last_el_x = wx;
+        last_el_y = wy;
+        started_above = true;
+      } else if (started_above) {
+        found_crossing = true;
+        break;
+      }
+    }
+
+    if (!started_above) continue;  // Entire ray is already at background — direction done
+
+    geometry_msgs::msg::Point fp;
+    fp.x = last_el_x;
+    fp.y = last_el_y;
+    if (goalOnBlacklist(fp)) continue;
+
+    double dx = fp.x - robot_pos.x;
+    double dy = fp.y - robot_pos.y;
+    double dist = std::sqrt(dx * dx + dy * dy);
+    if (dist < min_goal_distance_for_replanning_) continue;
+
+    unsigned int bx, by;
+    if (!costmap->worldToMap(fp.x, fp.y, bx, by)) continue;
+    if (costmap->getCost(bx, by) >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) continue;
+
+    frontier_exploration::Frontier f;
+    f.centroid     = fp;
+    f.middle       = fp;
+    f.initial      = fp;
+    f.size         = 1;
+    f.min_distance = dist;
+    f.is_radiation = true;
+    f.points.push_back(fp);
+    // Prefer confirmed boundary crossings; penalise max-range (zone may extend further)
+    f.cost      = dist * (found_crossing ? 1.0 : 2.0);
+    f.info_gain = dist;
+    boundary.push_back(f);
+  }
+
+  // Deduplicate boundary points within 1 m of each other
+  std::sort(boundary.begin(), boundary.end(),
     [](const frontier_exploration::Frontier & a, const frontier_exploration::Frontier & b) {
       return a.cost < b.cost;
     });
-
   std::vector<frontier_exploration::Frontier> result;
-  for (const auto & f : candidates) {
+  for (const auto & f : boundary) {
     bool too_close = false;
     for (const auto & kept : result) {
-      double dx = f.centroid.x - kept.centroid.x;
-      double dy = f.centroid.y - kept.centroid.y;
-      if (dx * dx + dy * dy < 1.0) { too_close = true; break; }
+      double ddx = f.centroid.x - kept.centroid.x;
+      double ddy = f.centroid.y - kept.centroid.y;
+      if (ddx * ddx + ddy * ddy < 1.0) { too_close = true; break; }
     }
     if (!too_close) result.push_back(f);
   }
 
-  RCLCPP_DEBUG(logger_, "Generated %zu directional radiation frontiers.", result.size());
+  RCLCPP_DEBUG(logger_, "Generated %zu boundary survey frontiers.", result.size());
   return result;
 }
 
@@ -935,12 +1029,25 @@ void Explore::makePlan()
     remaining_dose_budget, dose_budget_scale_);
 
   // In radiation mode:
-  // 1. Generate gradient-based radiation frontiers and prepend them so they are
-  //    evaluated first — radiation frontiers take priority over spatial ones.
-  // 2. Also re-sort the spatial portion toward higher-radiation areas.
+  // 1. Generate radiation frontiers (ascent phase or boundary survey phase).
+  // 2. If the boundary survey is complete (no more frontiers), exit RADIATION mode.
+  // 3. Re-sort remaining frontiers so spatial fallbacks are radiation-aware.
   if (exploration_mode_ == ExplorationMode::RADIATION && !latest_heatmap_.empty()) {
     auto rad_frontiers = generateRadiationFrontiers();
-    if (!rad_frontiers.empty()) {
+
+    if (rad_frontiers.empty() && radiation_in_boundary_phase_) {
+      // All boundary survey points have been visited — zone is fully mapped.
+      exploration_mode_ = ExplorationMode::SPATIAL;
+      radiation_in_boundary_phase_ = false;
+      radiation_mode_above_count_ = 0;
+      recent_rad_buffer_.clear();
+      std_msgs::msg::String mode_msg;
+      mode_msg.data = "spatial_exploration";
+      mode_publisher_->publish(mode_msg);
+      RCLCPP_INFO(logger_,
+        "Radiation zone boundary survey complete. Returning to SPATIAL mode.");
+      // Fall through — spatial frontiers from searchFrom() are already in `frontiers`
+    } else if (!rad_frontiers.empty()) {
       frontiers.insert(frontiers.begin(), rad_frontiers.begin(), rad_frontiers.end());
     }
 
@@ -1401,6 +1508,7 @@ bool Explore::setRadiationSeekingCallback(
   std::shared_ptr<std_srvs::srv::SetBool::Response> response)
 {
   exploration_mode_ = request->data ? ExplorationMode::RADIATION : ExplorationMode::SPATIAL;
+  radiation_in_boundary_phase_ = false;
   radiation_mode_above_count_ = 0;
   recent_rad_buffer_.clear();
   std_msgs::msg::String mode_msg;
@@ -1421,10 +1529,12 @@ bool Explore::toggleModeServiceCallback(
 {
   if (exploration_mode_ == ExplorationMode::SPATIAL) {
     exploration_mode_ = ExplorationMode::RADIATION;
+    radiation_in_boundary_phase_ = false;  // start with ascent on manual entry
     radiation_mode_above_count_ = radiation_mode_entry_hysteresis_;  // skip entry hysteresis
     recent_rad_buffer_.clear();
   } else {
     exploration_mode_ = ExplorationMode::SPATIAL;
+    radiation_in_boundary_phase_ = false;
     radiation_mode_above_count_ = 0;
     recent_rad_buffer_.clear();
     if (goal_active_) {
@@ -1442,6 +1552,64 @@ bool Explore::toggleModeServiceCallback(
   response->success = true;
   response->message = std::string("Toggled to: ") + mode_msg.data;
   RCLCPP_INFO(logger_, "Manual toggle: %s", response->message.c_str());
+  return true;
+}
+
+bool Explore::resetServiceCallback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  // --- 1. Stop any active navigation ---
+  stop(false);
+
+  // --- 2. Clear exploration state ---
+  frontier_blacklist_.clear();
+  cumulative_dose_        = 0.0;
+  no_frontier_count_      = 0;
+  frontiers_explored_count_ = 0;
+  is_recovering_          = false;
+  is_verifying_           = false;
+  verification_attempts_  = 0;
+  exploration_finished_   = false;
+  has_last_trajectory_    = false;
+  has_queued_target_      = false;
+  last_goal_successful_   = true;
+
+  // --- 3. Reset radiation mode to SPATIAL ---
+  exploration_mode_              = ExplorationMode::SPATIAL;
+  radiation_in_boundary_phase_   = false;
+  radiation_mode_above_count_    = 0;
+  recent_rad_buffer_.clear();
+  rad_bg_buffer_.clear();
+  rad_bg_mean_ = 0.0;
+  rad_bg_std_  = 1.0;
+
+  // --- 4. Re-capture initial pose from the robot's current position ---
+  if (return_to_init_) {
+    std::string map_frame = costmap_client_.getGlobalFrameID();
+    try {
+      auto tf = tf_buffer_.lookupTransform(
+        map_frame, robot_base_frame_, tf2::TimePointZero);
+      initial_pose_.position.x = tf.transform.translation.x;
+      initial_pose_.position.y = tf.transform.translation.y;
+      initial_pose_.orientation = tf.transform.rotation;
+    } catch (tf2::TransformException & ex) {
+      RCLCPP_WARN(logger_, "Reset: could not refresh initial pose: %s", ex.what());
+    }
+  }
+
+  // --- 5. Re-publish latched topics with reset values ---
+  std_msgs::msg::String mode_msg;
+  mode_msg.data = "spatial_exploration";
+  mode_publisher_->publish(mode_msg);
+
+  std_msgs::msg::Bool finished_msg;
+  finished_msg.data = false;
+  exploration_finished_publisher_->publish(finished_msg);
+
+  response->success = true;
+  response->message = "Explore node reset: blacklist cleared, dose zeroed, mode → SPATIAL.";
+  RCLCPP_INFO(logger_, "Explore node reset via service.");
   return true;
 }
 
