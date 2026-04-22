@@ -61,6 +61,7 @@
 #include <sensor_msgs/msg/battery_state.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
 
@@ -151,6 +152,9 @@ private:
     rclcpp::Subscription < sensor_msgs::msg::Image > ::SharedPtr heatmap_sub_;
     void heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg);
 
+    rclcpp::Subscription < geometry_msgs::msg::PointStamped > ::SharedPtr stable_source_sub_;
+    void stableSourceCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
+
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
     double prev_distance_;
@@ -174,6 +178,10 @@ private:
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr stop_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr return_to_initial_pose_service_;
     rclcpp::Service < std_srvs::srv::SetBool > ::SharedPtr radiation_seeking_service_;
+    rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr toggle_mode_service_;
+    bool toggleModeServiceCallback(
+      const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
+      std::shared_ptr < std_srvs::srv::Trigger::Response > response);
     rclcpp::Publisher < std_msgs::msg::String > ::SharedPtr mode_publisher_;
 
     bool startExplorationServiceCallback(
@@ -235,7 +243,34 @@ private:
     double safe_dose_threshold_mrem_hr_;
     double current_radiation_rate_ = 0.0;
     bool is_recovering_ = false;
-    bool radiation_seeking_mode_ = false;
+
+    enum class ExplorationMode { SPATIAL, RADIATION };
+    ExplorationMode exploration_mode_ = ExplorationMode::SPATIAL;
+
+    // Rolling background estimator — mirrors the heatmap node's logic so the
+    // explore node uses the same Poisson-aware dynamic threshold rather than a
+    // fixed parameter that the spatially-varying background can easily exceed.
+    static constexpr size_t RAD_BG_BUFFER_SIZE = 50;
+    static constexpr double RAD_ELEVATION_SIGMA = 2.5;
+    std::deque<double> rad_bg_buffer_;
+    double rad_bg_mean_ = 0.0;
+    double rad_bg_std_  = 1.0;   // conservative until buffer fills
+    void updateRadBgStats();
+
+    // Entry hysteresis: require this many consecutive above-threshold readings
+    // before switching TO radiation mode.
+    int radiation_mode_entry_hysteresis_ = 5;
+    int radiation_mode_above_count_ = 0;
+
+    // Exit hysteresis: use a rolling window of recent readings.
+    // Exit RADIATION mode when the window mean drops below the dynamic threshold,
+    // rather than requiring N *consecutive* below readings (which resets on every
+    // spike and never accumulates in a noisy transition zone).
+    int radiation_mode_hysteresis_ = 10;
+    std::deque<double> recent_rad_buffer_;
+
+    std::vector<frontier_exploration::Frontier> generateRadiationFrontiers();
+
     cv::Mat latest_heatmap_;
 
     // Explored area tracking

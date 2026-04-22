@@ -24,6 +24,7 @@ namespace frontier_exploration
     double path_heading_x = 0.0;  // unit-vector: initial Dijkstra step direction toward this frontier
     double path_heading_y = 0.0;
     std::vector < geometry_msgs::msg::Point > points;
+    bool is_radiation = false;    // true = radiation frontier (gradient-based), false = spatial
   };
 
 /**
