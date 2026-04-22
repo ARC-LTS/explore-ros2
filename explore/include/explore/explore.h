@@ -179,6 +179,10 @@ private:
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr return_to_initial_pose_service_;
     rclcpp::Service < std_srvs::srv::SetBool > ::SharedPtr radiation_seeking_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr toggle_mode_service_;
+    rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr reset_service_;
+    bool resetServiceCallback(
+      const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
+      std::shared_ptr < std_srvs::srv::Trigger::Response > response);
     bool toggleModeServiceCallback(
       const std::shared_ptr < std_srvs::srv::Trigger::Request > request,
       std::shared_ptr < std_srvs::srv::Trigger::Response > response);
@@ -246,6 +250,11 @@ private:
 
     enum class ExplorationMode { SPATIAL, RADIATION };
     ExplorationMode exploration_mode_ = ExplorationMode::SPATIAL;
+
+    // Set to true once the source peak is reached (gradient negligible) so the
+    // boundary survey phase persists until the full zone is mapped.  Cleared
+    // whenever RADIATION mode is re-entered from scratch.
+    bool radiation_in_boundary_phase_ = false;
 
     // Rolling background estimator — mirrors the heatmap node's logic so the
     // explore node uses the same Poisson-aware dynamic threshold rather than a
