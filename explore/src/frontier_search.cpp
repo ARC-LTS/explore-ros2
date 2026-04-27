@@ -18,12 +18,16 @@ FrontierSearch::FrontierSearch(
   nav2_costmap_2d::Costmap2D * costmap,
   double potential_scale, double gain_scale,
   double orientation_scale,
-  double min_frontier_size, rclcpp::Logger logger)
+  double min_frontier_size, double obstacle_penalty_scale,
+  double frontier_clustering_distance,
+  rclcpp::Logger logger)
 : costmap_(costmap)
   , potential_scale_(potential_scale)
   , gain_scale_(gain_scale)
   , orientation_scale_(orientation_scale)
   , min_frontier_size_(min_frontier_size)
+  , obstacle_penalty_scale_(obstacle_penalty_scale)
+  , frontier_clustering_distance_(frontier_clustering_distance)
   , logger_(logger)
 {
 }
@@ -158,6 +162,65 @@ FrontierSearch::searchFrom(
       critical_dose_mrem_hr, explored_grid, current_goal,
       remaining_dose_budget, dose_budget_scale);
   }
+
+  // --- Frontier Clustering ("Mean Frontier Candidate") ---
+  if (frontier_clustering_distance_ > 0.0 && !frontier_list.empty()) {
+    std::vector<Frontier> clustered_list;
+    // Sort by size to use larger frontiers as cluster seeds
+    std::sort(frontier_list.begin(), frontier_list.end(),
+              [](const Frontier& a, const Frontier& b) { return a.size > b.size; });
+
+    for (const auto& f : frontier_list) {
+      bool merged = false;
+      for (auto& cluster : clustered_list) {
+        double dx = f.centroid.x - cluster.centroid.x;
+        double dy = f.centroid.y - cluster.centroid.y;
+        double dist = std::sqrt(dx * dx + dy * dy);
+
+        if (dist < frontier_clustering_distance_) {
+          // Merge f into cluster
+          double total_size = static_cast<double>(cluster.size + f.size);
+          // Weighted average for centroid
+          cluster.centroid.x = (cluster.centroid.x * cluster.size + f.centroid.x * f.size) / total_size;
+          cluster.centroid.y = (cluster.centroid.y * cluster.size + f.centroid.y * f.size) / total_size;
+          
+          cluster.size += f.size;
+          cluster.info_gain += f.info_gain;
+          
+          // Use the 'middle' point of the best (lowest cost) frontier as the target
+          if (f.cost < cluster.cost) {
+              cluster.middle = f.middle;
+              cluster.initial = f.initial;
+              cluster.path_heading_x = f.path_heading_x;
+              cluster.path_heading_y = f.path_heading_y;
+              cluster.min_distance = f.min_distance;
+              cluster.cost = f.cost; // Temporarily update cost
+          }
+          
+          // Add points to cluster (optional, but good for visualization)
+          cluster.points.insert(cluster.points.end(), f.points.begin(), f.points.end());
+          
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        clustered_list.push_back(f);
+      }
+    }
+    
+    // Final pass: Recalculate cost for the merged cluster
+    for (auto & cluster : clustered_list) {
+        cluster.cost = frontierCost(
+          cluster, robot_yaw, battery_state, position, home_pos,
+          energy_per_meter, battery_safety_margin, battery_penalty_scale,
+          heatmap, radiation_scale, radiation_gradient_scale,
+          critical_dose_mrem_hr, explored_grid, current_goal,
+          remaining_dose_budget, dose_budget_scale);
+    }
+    frontier_list = clustered_list;
+  }
+
   std::sort(
     frontier_list.begin(), frontier_list.end(),
     [](const Frontier & f1, const Frontier & f2) {return f1.cost < f2.cost;});
@@ -310,8 +373,8 @@ bool FrontierSearch::isNewFrontierCell(
       }
       // If clearance is requested, we check if the neighbor's cost is low enough.
       // A cost of 0 (FREE_SPACE) is the safest.
-      // As a heuristic, we'll use a threshold of 50 to ensure some distance from obstacles while being more tolerant.
-      if (map_[nbr] < 50) {
+      // As a heuristic, we'll use a threshold of 20 to ensure some distance from obstacles while being more tolerant.
+      if (map_[nbr] < 20) {
         return true;
       }
     }
@@ -374,6 +437,20 @@ double FrontierSearch::frontierCost(
   double max_size_gain = potential_scale_ * frontier.min_distance * 0.25;
   size_gain = std::min(size_gain, max_size_gain);
   double original_cost = (potential_scale_ * frontier.min_distance) - size_gain;
+
+  // Obstacle Penalty
+  // Penalize frontiers that are in high-cost areas (e.g. inflation buffer)
+  // to favor free-space frontiers unless no others are available.
+  if (obstacle_penalty_scale_ > 0.0) {
+    unsigned int mx, my;
+    if (costmap_->worldToMap(frontier.centroid.x, frontier.centroid.y, mx, my)) {
+      unsigned char cost = map_[my * size_x_ + mx];
+      if (cost > 0 && cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+        // Linear penalty based on costmap value (0-252)
+        original_cost += obstacle_penalty_scale_ * cost;
+      }
+    }
+  }
 
   // Raycasting-based Information Gain (Request 2)
   // Uses incremental integer cell stepping to avoid worldToMap() on every inner

@@ -204,6 +204,8 @@ private:
     // parameters
     double planner_frequency_;
     double potential_scale_, orientation_scale_, gain_scale_;
+    double obstacle_penalty_scale_;
+    double frontier_clustering_distance_;
     double progress_timeout_;
     double min_frontier_clearance_;
     bool visualize_;
