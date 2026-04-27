@@ -82,6 +82,8 @@ Explore::Explore()
   this->declare_parameter<double>("potential_scale", 1.0);
   this->declare_parameter<double>("orientation_scale", 10.0);
   this->declare_parameter<double>("gain_scale", 1.0);
+  this->declare_parameter<double>("obstacle_penalty_scale", 1.0);
+  this->declare_parameter<double>("frontier_clustering_distance", 3.0);
   this->declare_parameter<double>("min_frontier_size", 0.5);
   this->declare_parameter<double>("min_frontier_clearance", 0.1);
   this->declare_parameter<bool>("return_to_init", false);
@@ -113,6 +115,8 @@ Explore::Explore()
   this->get_parameter("potential_scale", potential_scale_);
   this->get_parameter("orientation_scale", orientation_scale_);
   this->get_parameter("gain_scale", gain_scale_);
+  this->get_parameter("obstacle_penalty_scale", obstacle_penalty_scale_);
+  this->get_parameter("frontier_clustering_distance", frontier_clustering_distance_);
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("min_frontier_clearance", min_frontier_clearance_);
   this->get_parameter("return_to_init", return_to_init_);
@@ -155,7 +159,8 @@ Explore::Explore()
     costmap_client_.getCostmap(),
     potential_scale_, gain_scale_,
     orientation_scale_,
-    min_frontier_size, logger_);
+    min_frontier_size, obstacle_penalty_scale_,
+    frontier_clustering_distance_, logger_);
 
   if (visualize_) {
     marker_array_publisher_ =

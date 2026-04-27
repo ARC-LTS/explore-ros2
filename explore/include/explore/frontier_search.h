@@ -44,7 +44,9 @@ public:
     FrontierSearch(
       nav2_costmap_2d::Costmap2D * costmap, double potential_scale,
       double gain_scale, double orientation_scale,
-      double min_frontier_size, rclcpp::Logger logger);
+      double min_frontier_size, double obstacle_penalty_scale,
+      double frontier_clustering_distance,
+      rclcpp::Logger logger);
 
     /**
      * @brief Runs search implementation, outward from the start position
@@ -131,6 +133,8 @@ private:
     unsigned int size_x_, size_y_;
     double potential_scale_, gain_scale_, orientation_scale_;
     double min_frontier_size_;
+    double obstacle_penalty_scale_;
+    double frontier_clustering_distance_;
     rclcpp::Logger logger_;
   };
 }  // namespace frontier_exploration

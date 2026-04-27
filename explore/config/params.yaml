@@ -7,13 +7,14 @@
     costmap_updates_topic: /global_costmap/costmap_updates
     visualize: true
     planner_frequency: 1.0
-    progress_timeout: 30.0
+    progress_timeout: 20.0
     potential_scale: 10.0
     orientation_scale: 6.0
     gain_scale: 5.0
+    obstacle_penalty_scale: 2.0
     transform_tolerance: 0.3
     min_frontier_size: 0.25
-    min_frontier_clearance: 0.0
+    min_frontier_clearance: 1.0
     no_frontier_retry: 3
     battery_topic: /battery_state
     energy_per_meter: 0.000185  # fraction of battery (0-1 scale) per meter; derived from
