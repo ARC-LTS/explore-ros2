@@ -207,7 +207,16 @@ Explore::Explore()
   move_base_client_->wait_for_action_server();
   RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
 
-  if (return_to_init_) {
+  // Captured unconditionally (not gated on return_to_init_): handleExploration
+  // Completion() unconditionally targets initial_pose_ on any forced
+  // completion (battery/dose exhausted, verification exhausted) regardless
+  // of return_to_init_'s value. With the old return_to_init_ gate here,
+  // initial_pose_ was left at its default-constructed (0,0,0, all-zero/
+  // invalid quaternion) value whenever return_to_init_ was false -- its
+  // default -- so every forced return-to-initial-pose goal targeted a
+  // degenerate pose and was cancelled within ~2s (observed directly: logged
+  // "Failed to return to initial pose: 5" every time, robot never moved).
+  {
     RCLCPP_INFO(logger_, "Getting initial pose of the robot");
     geometry_msgs::msg::TransformStamped transformStamped;
     std::string map_frame = costmap_client_.getGlobalFrameID();
@@ -221,7 +230,6 @@ Explore::Explore()
       RCLCPP_ERROR(
         logger_, "Couldn't find transform from %s to %s: %s",
         map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
-      return_to_init_ = false;
     }
   }
 
@@ -1668,7 +1676,9 @@ bool Explore::resetServiceCallback(
   rad_bg_std_  = 1.0;
 
   // --- 4. Re-capture initial pose from the robot's current position ---
-  if (return_to_init_) {
+  // Unconditional -- see the constructor for why this can't be gated on
+  // return_to_init_.
+  {
     std::string map_frame = costmap_client_.getGlobalFrameID();
     try {
       auto tf = tf_buffer_.lookupTransform(
