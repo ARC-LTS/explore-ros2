@@ -162,6 +162,19 @@ private:
     rclcpp::Time last_progress_;
     size_t last_markers_count_;
 
+    // Set by feedbackCallback when Nav2's recovery count increases; consumed
+    // by makePlan() on its next tick, which cancels the current frontier goal
+    // and sends a retreat-to-safety goal instead of letting explore_lite keep
+    // replanning frontiers on top of whatever made Nav2 recover in the first
+    // place.
+    bool recalibration_requested_ = false;
+    // True from when a retreat-to-safety goal is sent until its result comes
+    // back; while true, makePlan() does not evaluate or replace frontiers.
+    bool recalibrating_ = false;
+    // True only for the currently in-flight goal if it's a recalibration
+    // goal, so resultCallback can skip frontier-specific bookkeeping for it.
+    bool current_goal_is_recalibration_ = false;
+
     geometry_msgs::msg::Pose initial_pose_;
     geometry_msgs::msg::Pose goal_start_pose_;
     double last_trajectory_yaw_;
@@ -227,7 +240,11 @@ private:
     bool last_goal_successful_ = false;
     double min_goal_distance_for_replanning_;
 
-    void sendGoal(const geometry_msgs::msg::Point & target);
+    // is_recalibration marks a goal sent to retreat the robot to nearby safe
+    // space after a Nav2 recovery, rather than a normal frontier goal -- see
+    // resultCallback, which skips frontier bookkeeping (blacklisting,
+    // frontiers_explored_count_) for these.
+    void sendGoal(const geometry_msgs::msg::Point & target, bool is_recalibration = false);
 
     // battery-aware parameters
     std::string battery_topic_;
@@ -294,11 +311,14 @@ private:
 
     void handleExplorationCompletion(bool force_return = false);
     void startVerification();
-    // found_safe is set to false if no cell within the search radius cleared
-    // the inscribed-obstacle/low-cost check, in which case the returned point
-    // is not safe to send as a goal (see explore.cpp for why this matters).
+    // Searches a small radius around `center` for a low-cost, non-inscribed-
+    // obstacle cell to use as a goal -- used both to back a frontier goal off
+    // a wall/shelf, and (centered on the robot's own pose) to find nearby
+    // free space to retreat to after a Nav2 recovery. found_safe is set to
+    // false if no cell within the search radius cleared the check, in which
+    // case the returned point is not safe to send as a goal.
     geometry_msgs::msg::Point findSafeViewpoint(
-      const frontier_exploration::Frontier & frontier, bool & found_safe);
+      const geometry_msgs::msg::Point & center, bool & found_safe);
   };
 }  // namespace explore
 

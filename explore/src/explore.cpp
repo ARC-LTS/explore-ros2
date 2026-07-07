@@ -969,6 +969,36 @@ void Explore::makePlan()
     return;
   }
 
+  // --- Stage 0.5: Nav2 recovery -> retreat to safety ---
+  // Don't let explore_lite's frontier replanning fight whatever Nav2 is doing
+  // to get unstuck. Cancel the active frontier goal and send a goal to
+  // nearby free space instead; wait for that to finish before picking a new
+  // frontier. See feedbackCallback for the trigger.
+  if (recalibration_requested_) {
+    recalibration_requested_ = false;
+    RCLCPP_WARN(
+      logger_,
+      "Nav2 recovered while navigating. Retreating to nearby safe space before resuming exploration.");
+    if (goal_active_) {
+      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      goal_active_ = false;
+    }
+    bool safe_found = false;
+    geometry_msgs::msg::Point safe_point = findSafeViewpoint(pose.position, safe_found);
+    if (safe_found) {
+      recalibrating_ = true;
+      sendGoal(safe_point, true);
+      return;
+    }
+    RCLCPP_WARN(
+      logger_, "No nearby safe cell found to retreat to; resuming normal frontier planning.");
+  }
+
+  if (recalibrating_) {
+    RCLCPP_DEBUG(logger_, "Retreating to safe space. Deferring frontier planning.");
+    return;
+  }
+
   // --- Stage 1: Check current navigation goal status ---
   if (waiting_for_goal_response_) {
     RCLCPP_DEBUG(logger_, "Waiting for goal response. Deferring new plan.");
@@ -979,7 +1009,14 @@ void Explore::makePlan()
   if (goal_active_) {
     // 1. Check for timeout
     if ((this->now() - last_progress_) > tf2::durationFromSec(progress_timeout_)) {
-      RCLCPP_WARN(logger_, "Active goal timed out. Re-planning.");
+      // Blacklist on timeout too, not just blocked/already-explored: without
+      // this, a goal that times out gets cancelled and immediately
+      // re-selected (frontier search doesn't otherwise know it's bad),
+      // producing a loop of the same goal timing out over and over.
+      RCLCPP_WARN(
+        logger_, "Active goal timed out. Blacklisting (%.2f, %.2f) and re-planning.",
+        last_sent_goal_position_.x, last_sent_goal_position_.y);
+      frontier_blacklist_.push_back(last_sent_goal_position_);
       is_current_goal_invalid = true;
     }
     // 2. Check if current goal is now blocked OR already explored (no longer unknown)
@@ -1137,7 +1174,7 @@ void Explore::makePlan()
     //    clears the footprint's inflation buffer (too tight to approach safely
     //    right now), rather than sending a goal Nav2 can never settle into.
     bool safe_viewpoint_found = false;
-    best_target = findSafeViewpoint(f, safe_viewpoint_found);
+    best_target = findSafeViewpoint(f.middle, safe_viewpoint_found);
     if (!safe_viewpoint_found) {
       frontier_it++;
       continue;
@@ -1201,14 +1238,17 @@ void Explore::makePlan()
   }
 }
 
-void Explore::sendGoal(const geometry_msgs::msg::Point & target)
+void Explore::sendGoal(const geometry_msgs::msg::Point & target, bool is_recalibration)
 {
   geometry_msgs::msg::PoseStamped pose_stamped;
   if (!costmap_client_.getRobotPose(pose_stamped)) {
     return;
   }
   auto pose = pose_stamped.pose;
-  RCLCPP_INFO(logger_, "Sending navigation goal to (%.2f, %.2f).", target.x, target.y);
+  current_goal_is_recalibration_ = is_recalibration;
+  RCLCPP_INFO(
+    logger_, "Sending %snavigation goal to (%.2f, %.2f).",
+    is_recalibration ? "retreat-to-safety " : "", target.x, target.y);
 
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = target;
@@ -1419,6 +1459,15 @@ void Explore::goalResponseCallback(const NavigationGoalHandle::SharedPtr & goal_
   if (!goal_handle) {
     RCLCPP_ERROR(logger_, "Goal was rejected by action server.");
     goal_active_ = false;
+    // resultCallback (the only other place that clears these) never fires
+    // for a rejected goal -- without this, a rejected retreat-to-safety goal
+    // would leave recalibrating_ stuck true forever, permanently blocking
+    // makePlan() from ever picking a frontier again.
+    if (current_goal_is_recalibration_) {
+      RCLCPP_WARN(logger_, "Retreat-to-safety goal was rejected. Resuming frontier planning anyway.");
+      recalibrating_ = false;
+      current_goal_is_recalibration_ = false;
+    }
   } else {
     RCLCPP_INFO(logger_, "Goal accepted by action server, waiting for result.");
     goal_active_ = true;
@@ -1443,6 +1492,14 @@ void Explore::feedbackCallback(
       feedback->number_of_recoveries);
     last_progress_ = this->now();
     last_recovery_count_ = feedback->number_of_recoveries;
+
+    // Don't fight Nav2's own recovery: request that makePlan() (on its next
+    // tick) cancel this goal and retreat to nearby safe space, instead of
+    // leaving explore_lite free to blacklist/replace this goal out from under
+    // whatever Nav2 is doing to get unstuck. Skip if we're already mid-retreat.
+    if (!recalibrating_) {
+      recalibration_requested_ = true;
+    }
   }
 }
 
@@ -1457,6 +1514,20 @@ void Explore::resultCallback(
   }
 
   goal_active_ = false; // Reset goal_active_ for the CURRENT goal
+
+  if (current_goal_is_recalibration_) {
+    RCLCPP_INFO(
+      logger_,
+      "Retreat-to-safety goal at (%.2f, %.2f) finished (code %d). Resuming frontier planning.",
+      frontier_goal.x, frontier_goal.y, static_cast<int>(result.code));
+    recalibrating_ = false;
+    current_goal_is_recalibration_ = false;
+    has_queued_target_ = false;
+    if (!waiting_for_goal_response_ && !stopped_) {
+      makePlan();
+    }
+    return;
+  }
 
   // Update trajectory information based on the movement since the goal was started
   geometry_msgs::msg::PoseStamped pose_stamped;
@@ -1662,6 +1733,12 @@ void Explore::resume()
   resuming_ = true;
   no_frontier_count_ = 0;
   has_last_trajectory_ = false;
+  // Defensive: a stop() while retreating cancels the goal, whose CANCELED
+  // result normally clears these -- but don't let a lost/delayed result
+  // leave frontier planning wedged off after an external stop/resume cycle.
+  recalibration_requested_ = false;
+  recalibrating_ = false;
+  current_goal_is_recalibration_ = false;
   RCLCPP_INFO(logger_, "Exploration resuming.");
   // Reactivate the timer
   exploring_timer_->reset();
@@ -1670,16 +1747,16 @@ void Explore::resume()
 }
 
 geometry_msgs::msg::Point Explore::findSafeViewpoint(
-  const frontier_exploration::Frontier & frontier, bool & found_safe)
+  const geometry_msgs::msg::Point & center, bool & found_safe)
 {
   found_safe = false;
   nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
   unsigned int mx, my;
-  if (!costmap->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
-    return frontier.middle;
+  if (!costmap->worldToMap(center.x, center.y, mx, my)) {
+    return center;
   }
 
-  // Search in a small radius around the frontier point for a cell that is:
+  // Search in a small radius around `center` for a cell that is:
   // 1. FREE_SPACE (cost 0 or very low)
   // 2. Not adjacent to lethal/inscribed obstacles
 
@@ -1687,15 +1764,9 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(
   double search_radius = 1.0; // Search within 1 meter
   int cell_radius = static_cast<int>(search_radius / resolution);
 
-  geometry_msgs::msg::Point safe_point = frontier.middle;
+  geometry_msgs::msg::Point safe_point = center;
   unsigned char min_cost = 255;
   double min_dist_to_target = std::numeric_limits<double>::infinity();
-
-  geometry_msgs::msg::PoseStamped pose_stamped;
-  if (!costmap_client_.getRobotPose(pose_stamped)) {
-    return frontier.middle;
-  }
-  auto robot_pose = pose_stamped.pose;
 
   for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
     for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
@@ -1719,13 +1790,12 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(
         double wx, wy;
         costmap->mapToWorld(cx, cy, wx, wy);
 
-        // Favor points that are closer to the frontier middle (the target)
-        // while still being safe and navigable.
-        double dx_f = wx - frontier.middle.x;
-        double dy_f = wy - frontier.middle.y;
+        // Favor points that are closer to `center` while still being safe and navigable.
+        double dx_f = wx - center.x;
+        double dy_f = wy - center.y;
         double dist_to_target = dx_f * dx_f + dy_f * dy_f;
 
-        // Prefer lower cost first, then closer to frontier middle
+        // Prefer lower cost first, then closer to center
         if (cost < min_cost) {
           min_cost = cost;
           min_dist_to_target = dist_to_target;
@@ -1741,11 +1811,11 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(
   }
 
   // min_cost stays at its 255 sentinel iff no cell in the search radius
-  // cleared the "< INSCRIBED_INFLATED_OBSTACLE && < 50" check above — i.e.
-  // the frontier sits in a gap too tight for this footprint to clear inflation
-  // on either side. Returning frontier.middle in that case (the old behaviour)
-  // sent a goal that Nav2 could never actually settle into, which is what
-  // produced "won't move" episodes near tight-but-technically-open spaces.
+  // cleared the "< INSCRIBED_INFLATED_OBSTACLE && < 50" check above -- i.e.
+  // `center` sits in a gap too tight for this footprint to clear inflation on
+  // either side. Returning `center` unvalidated in that case sent a goal Nav2
+  // could never actually settle into, which is what produced "won't move"
+  // episodes near tight-but-technically-open spaces.
   found_safe = (min_cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
   return safe_point;
 }
