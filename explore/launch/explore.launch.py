@@ -33,6 +33,14 @@ def launch_setup(context, *args, **kwargs):
             'radiation_scale': 0.0,
             'radiation_gradient_scale': 0.0,
             'dose_budget_scale': 0.0,
+            # explore_node's own internal acute-dose yield (radiationCallback)
+            # blacklists the current goal and stops to yield to
+            # local_recovery_node -- a navigational reaction to radiation in
+            # its own right, distinct from rad_safety's hard emergency brake
+            # (which stays active in both arms per the test plan's design).
+            # Neutralized here too so Baseline's frontier selection is never
+            # influenced by radiation readings at all.
+            'acute_dose_rate_mrem_hr': 1000000.0,
         })
 
     node = Node(
