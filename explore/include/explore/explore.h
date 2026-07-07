@@ -294,7 +294,11 @@ private:
 
     void handleExplorationCompletion(bool force_return = false);
     void startVerification();
-    geometry_msgs::msg::Point findSafeViewpoint(const frontier_exploration::Frontier & frontier);
+    // found_safe is set to false if no cell within the search radius cleared
+    // the inscribed-obstacle/low-cost check, in which case the returned point
+    // is not safe to send as a goal (see explore.cpp for why this matters).
+    geometry_msgs::msg::Point findSafeViewpoint(
+      const frontier_exploration::Frontier & frontier, bool & found_safe);
   };
 }  // namespace explore
 

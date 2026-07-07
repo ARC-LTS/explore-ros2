@@ -1133,8 +1133,15 @@ void Explore::makePlan()
       continue;
     }
 
-    // 4. Generate viewpoint and check IF IT is blacklisted
-    best_target = findSafeViewpoint(f);
+    // 4. Generate viewpoint; skip this frontier if no cell near it actually
+    //    clears the footprint's inflation buffer (too tight to approach safely
+    //    right now), rather than sending a goal Nav2 can never settle into.
+    bool safe_viewpoint_found = false;
+    best_target = findSafeViewpoint(f, safe_viewpoint_found);
+    if (!safe_viewpoint_found) {
+      frontier_it++;
+      continue;
+    }
     if (goalOnBlacklist(best_target)) {
       frontier_it++;
       continue;
@@ -1663,8 +1670,9 @@ void Explore::resume()
 }
 
 geometry_msgs::msg::Point Explore::findSafeViewpoint(
-  const frontier_exploration::Frontier & frontier)
+  const frontier_exploration::Frontier & frontier, bool & found_safe)
 {
+  found_safe = false;
   nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
   unsigned int mx, my;
   if (!costmap->worldToMap(frontier.middle.x, frontier.middle.y, mx, my)) {
@@ -1732,6 +1740,13 @@ geometry_msgs::msg::Point Explore::findSafeViewpoint(
     }
   }
 
+  // min_cost stays at its 255 sentinel iff no cell in the search radius
+  // cleared the "< INSCRIBED_INFLATED_OBSTACLE && < 50" check above — i.e.
+  // the frontier sits in a gap too tight for this footprint to clear inflation
+  // on either side. Returning frontier.middle in that case (the old behaviour)
+  // sent a goal that Nav2 could never actually settle into, which is what
+  // produced "won't move" episodes near tight-but-technically-open spaces.
+  found_safe = (min_cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
   return safe_point;
 }
 
