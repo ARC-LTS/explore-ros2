@@ -38,6 +38,7 @@
 
 #include <explore/explore.h>
 
+#include <algorithm>
 #include <deque>
 #include <numeric>
 #include <thread>
@@ -89,6 +90,7 @@ Explore::Explore()
   this->declare_parameter<bool>("return_to_init", false);
   this->declare_parameter<bool>("auto_start", true);
   this->declare_parameter<int>("no_frontier_retry", 3);
+  this->declare_parameter<double>("stuck_grace_window_s", 20.0);
   this->declare_parameter<std::string>("battery_topic", "/battery_state");
   this->declare_parameter<double>("energy_per_meter", 0.1);
   this->declare_parameter<double>("battery_safety_margin", 0.1);
@@ -97,6 +99,7 @@ Explore::Explore()
   this->declare_parameter<double>("min_battery_percentage", 0.1);
   this->declare_parameter<std::string>("radiation_topic", "rad");
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
+  this->declare_parameter<std::string>("heatmap_std_topic", "/rad_heatmap/gp_std_dev");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
   this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
   this->declare_parameter<double>("acute_dose_rate_mrem_hr", 10.0);
@@ -104,10 +107,43 @@ Explore::Explore()
   this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.5);
   this->declare_parameter<double>("radiation_scale", 1.0);
   this->declare_parameter<double>("radiation_gradient_scale", 1.0);
+  // Information-gain-style attraction term, capped and safety-gate-blind
+  // (see frontierCost's seek_bonus): 0.0 reproduces the prior
+  // avoidance-only behavior exactly.
+  this->declare_parameter<double>("radiation_seek_scale", 0.0);
+  // When true, the seek term is scaled by how close the robot is to a
+  // progress-timeout stall (see effectiveRadiationSeekScale()) instead of
+  // applying radiation_seek_scale_ as a flat constant: near-zero during
+  // healthy exploration, ramping to the full configured scale only once the
+  // robot is genuinely failing to make progress. false reproduces the
+  // constant-scale behavior exactly.
+  this->declare_parameter<bool>("radiation_seek_adaptive", false);
+  // Stall-deficit window/threshold for effectiveRadiationSeekScale() when
+  // radiation_seek_adaptive_ is true: net displacement over the trailing
+  // stall_window_s_ seconds, below stall_min_displacement_m_ counts as
+  // (partially) stalled.
+  this->declare_parameter<double>("stall_window_s", 30.0);
+  this->declare_parameter<double>("stall_min_displacement_m", 1.0);
+  // Boundary-survey ray count (Phase 2 of RADIATION mode): fewer rays means
+  // fewer elevated-zone approach goals and therefore less mission time spent
+  // above the safe-dose threshold characterizing a source's extent, at the
+  // cost of a coarser boundary estimate. 8 reproduces the original behavior.
+  this->declare_parameter<int>("radiation_survey_dirs", 8);
+  // Alternative lever on the same time budget: cap total wall-clock time in
+  // the boundary survey directly, regardless of how many rays have been
+  // visited, rather than reducing angular coverage. 0.0 (default) disables
+  // the cap and reproduces the original behavior exactly.
+  this->declare_parameter<double>("radiation_survey_time_cap_s", 0.0);
   this->declare_parameter<int>("max_verification_attempts", 3);
   this->declare_parameter<double>("max_battery_used", 0.9);
   this->declare_parameter<int>("radiation_mode_hysteresis", 5);
   this->declare_parameter<int>("radiation_mode_entry_hysteresis", 5);
+  // Must stay in lockstep with local_recovery_node / rad_safety_monitor_node
+  // (see effectiveAcuteDoseThreshold()).
+  this->declare_parameter<double>("dose_budget_relaxation_k", 0.0);
+  this->declare_parameter<double>("dose_budget_relaxation_ceiling_mult", 2.0);
+  this->declare_parameter<double>("frontier_dose_spend_fraction", 0.05);
+  this->declare_parameter<double>("all_gated_completion_timeout_s", 180.0);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -122,6 +158,7 @@ Explore::Explore()
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("auto_start", auto_start);
   this->get_parameter("no_frontier_retry", no_frontier_retry_);
+  this->get_parameter("stuck_grace_window_s", stuck_grace_window_s_);
   this->get_parameter("battery_topic", battery_topic_);
   this->get_parameter("energy_per_meter", energy_per_meter_);
   this->get_parameter("battery_safety_margin", battery_safety_margin_);
@@ -130,6 +167,7 @@ Explore::Explore()
   this->get_parameter("min_battery_percentage", min_battery_percentage_);
   this->get_parameter("radiation_topic", radiation_topic_);
   this->get_parameter("heatmap_topic", heatmap_topic_);
+  this->get_parameter("heatmap_std_topic", heatmap_std_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
   this->get_parameter("critical_dose_mrem_hr", critical_dose_mrem_hr_);
   this->get_parameter("acute_dose_rate_mrem_hr", acute_dose_rate_mrem_hr_);
@@ -137,11 +175,27 @@ Explore::Explore()
   this->get_parameter("safe_dose_threshold_mrem_hr", safe_dose_threshold_mrem_hr_);
   this->get_parameter("radiation_scale", radiation_scale_);
   this->get_parameter("radiation_gradient_scale", radiation_gradient_scale_);
+  this->get_parameter("radiation_seek_scale", radiation_seek_scale_);
+  this->get_parameter("radiation_seek_adaptive", radiation_seek_adaptive_);
+  this->get_parameter("stall_window_s", stall_window_s_);
+  this->get_parameter("stall_min_displacement_m", stall_min_displacement_m_);
+  this->get_parameter("radiation_survey_dirs", radiation_survey_dirs_);
+  this->get_parameter("radiation_survey_time_cap_s", radiation_survey_time_cap_s_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
   this->get_parameter("max_battery_used", max_battery_used_);
   this->get_parameter("radiation_mode_hysteresis", radiation_mode_hysteresis_);
   this->get_parameter("radiation_mode_entry_hysteresis", radiation_mode_entry_hysteresis_);
+  this->get_parameter("dose_budget_relaxation_k", dose_budget_relaxation_k_);
+  this->get_parameter("dose_budget_relaxation_ceiling_mult", dose_budget_ceiling_mult_);
+  this->get_parameter("frontier_dose_spend_fraction", frontier_dose_spend_fraction_);
+  this->get_parameter("all_gated_completion_timeout_s", all_gated_completion_timeout_s_);
+  RCLCPP_INFO(logger_,
+    "Acute-dose yield threshold: base %.1f mrem/hr, dose_budget_relaxation_k=%.2f "
+    "(ceiling %.1fx). Frontier gating: lethal point ceiling tracks the effective "
+    "acute threshold; transit-dose spend fraction base %.3f.",
+    acute_dose_rate_mrem_hr_, dose_budget_relaxation_k_, dose_budget_ceiling_mult_,
+    frontier_dose_spend_fraction_);
 
   // Initialize new member variables
   last_sent_goal_position_.x = initial_pose_.position.x;
@@ -195,13 +249,40 @@ Explore::Explore()
     std::bind(&Explore::radiationCallback, this, std::placeholders::_1));
   last_radiation_update_ = this->now();
 
+  // Cross-layer contract plumbing (see currentBudgetMultiplier): prefer the
+  // dose-budget authority's remaining fraction over this node's own
+  // integration, and publish the multiplier actually in use for the
+  // evaluator's per-trial contract-coherence check.
+  budget_authority_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+    "/dose_budget/remaining_fraction", 10,
+    [this](const std_msgs::msg::Float64::SharedPtr msg) {
+      authority_fraction_ = msg->data;
+      authority_fraction_time_ = this->now();
+    });
+  multiplier_pub_ = this->create_publisher<std_msgs::msg::Float64>(
+    "~/dose_budget_multiplier", 10);
+  multiplier_timer_ = this->create_wall_timer(
+    std::chrono::seconds(1), [this]() {
+      std_msgs::msg::Float64 m;
+      m.data = currentBudgetMultiplier();
+      multiplier_pub_->publish(m);
+    });
+
   heatmap_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
     heatmap_topic_, 10,
     std::bind(&Explore::heatmapCallback, this, std::placeholders::_1));
 
+  heatmap_std_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+    heatmap_std_topic_, 10,
+    std::bind(&Explore::heatmapStdCallback, this, std::placeholders::_1));
+
   stable_source_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
     "/rad_heatmap/stable_source_captured", 10,
     std::bind(&Explore::stableSourceCallback, this, std::placeholders::_1));
+
+  stuck_escape_event_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+    "/stuck_escape/event", 10,
+    std::bind(&Explore::stuckEscapeEventCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
@@ -450,8 +531,11 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
       recent_mean, dynamic_threshold);
   }
 
-  // Evacuation on acute dose rates
-  if (current_radiation_rate_ > acute_dose_rate_mrem_hr_) {
+  // Evacuation on acute dose rates. The threshold relaxes with remaining
+  // dose budget in lockstep with the recovery nodes -- stopping here at the
+  // fixed threshold while their relaxed triggers sit higher would strand
+  // the robot in the gap with no rescuer (see effectiveAcuteDoseThreshold).
+  if (current_radiation_rate_ > effectiveAcuteDoseThreshold()) {
     if (!is_recovering_ && goal_active_) {
       RCLCPP_WARN(
         logger_,
@@ -471,6 +555,82 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
   }
 }
 
+// Identical formula to local_recovery_node's effectiveAcuteThreshold() and
+// rad_safety_monitor_node's effectiveThreshold(), computed from this node's
+// own sim-time cumulative dose. The three layers form a handoff contract:
+// this node stops itself and waits for local_recovery_node whenever the dose
+// rate crosses "acute", so its notion of acute must relax exactly as much as
+// the recovery nodes' triggers do, or a dose band opens up in which this
+// node has stopped but no recovery node will ever fire to restart it.
+double Explore::effectiveAcuteDoseThreshold()
+{
+  return acute_dose_rate_mrem_hr_ * currentBudgetMultiplier();
+}
+
+// Same relaxation family applied at the targeting layer: how much of the
+// remaining dose budget a single frontier visit may cost. k=0 leaves the
+// base fraction; a full budget at k=1 doubles it, bounded by the shared
+// ceiling multiplier and by 1.0 (a single frontier may never be allowed to
+// spend more than everything that remains).
+double Explore::effectiveFrontierSpendFraction()
+{
+  return std::min(frontier_dose_spend_fraction_ * currentBudgetMultiplier(), 1.0);
+}
+
+// The shared relaxation multiplier, min(ceiling, 1 + k * f_remaining).
+// Prefers the dose-budget authority's published remaining fraction
+// (rad_evaluator_node, whose integration is the campaign's reported ground
+// truth) whenever it is fresh, so every layer's threshold scales by the
+// same value by construction; falls back to this node's own sim-time
+// integration for the window before the evaluator is up.
+double Explore::currentBudgetMultiplier()
+{
+  double remaining_fraction = 1.0;
+  bool authority_fresh = authority_fraction_ >= 0.0 &&
+    authority_fraction_time_.nanoseconds() > 0 &&
+    (this->now() - authority_fraction_time_) < tf2::durationFromSec(5.0);
+  if (authority_fresh) {
+    remaining_fraction = authority_fraction_;
+  } else if (max_radiation_dose_ > 0.0) {
+    remaining_fraction = std::max(
+      0.0, (max_radiation_dose_ - cumulative_dose_) / max_radiation_dose_);
+  }
+  return std::min(
+    1.0 + dose_budget_relaxation_k_ * remaining_fraction, dose_budget_ceiling_mult_);
+}
+
+// See explore.h for the rationale, including why this uses recent_positions_
+// directly rather than last_progress_/progress_timeout_ (an earlier version
+// did, and was found to be an unreliable stall proxy: last_progress_ is
+// reset by unrelated bookkeeping -- goal-sent, Nav2 recovery, stuck-escape
+// grace -- often enough that it could read "healthy" during a mission that
+// was macroscopically going nowhere; see explore.h). Constant-scale behavior
+// is preserved exactly when radiation_seek_adaptive_ is false.
+double Explore::effectiveRadiationSeekScale()
+{
+  if (!radiation_seek_adaptive_ || radiation_seek_scale_ == 0.0) {
+    return radiation_seek_scale_;
+  }
+  // Require a full window of history before this signal means anything;
+  // treat "not enough history yet" (mission just started) as healthy
+  // (deficit 0) rather than stalled -- this is also what keeps the ramp
+  // from reading as an immediate full-scale stall at mission start, the
+  // failure mode the old timer-based version had.
+  if (recent_positions_.empty() ||
+    (this->now() - recent_positions_.front().first).seconds() < stall_window_s_)
+  {
+    return 0.0;
+  }
+  const auto & oldest = recent_positions_.front().second;
+  const auto & newest = recent_positions_.back().second;
+  double dx = newest.x - oldest.x;
+  double dy = newest.y - oldest.y;
+  double displacement = std::sqrt(dx * dx + dy * dy);
+  double deficit = std::clamp(
+    1.0 - displacement / stall_min_displacement_m_, 0.0, 1.0);
+  return radiation_seek_scale_ * deficit;
+}
+
 void Explore::heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
   try {
@@ -479,6 +639,17 @@ void Explore::heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg)
     latest_heatmap_ = cv_ptr->image;
   } catch (const cv_bridge::Exception & e) {
     RCLCPP_ERROR(logger_, "cv_bridge exception in explore node: %s", e.what());
+  }
+}
+
+void Explore::heatmapStdCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+{
+  try {
+    cv_bridge::CvImagePtr cv_ptr =
+      cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+    latest_heatmap_std_ = cv_ptr->image;
+  } catch (const cv_bridge::Exception & e) {
+    RCLCPP_ERROR(logger_, "cv_bridge exception in explore node (heatmap std): %s", e.what());
   }
 }
 
@@ -509,6 +680,11 @@ void Explore::stableSourceCallback(const geometry_msgs::msg::PointStamped::Share
     goal_active_ = false;
     has_queued_target_ = false;
   }
+}
+
+void Explore::stuckEscapeEventCallback(const std_msgs::msg::Float64::SharedPtr /*msg*/)
+{
+  last_stuck_recovery_time_ = this->now();
 }
 
 void Explore::updateExploredArea()
@@ -848,11 +1024,30 @@ std::vector<frontier_exploration::Frontier> Explore::generateRadiationFrontiers(
   // -----------------------------------------------------------------------
   if (!radiation_in_boundary_phase_) {
     radiation_in_boundary_phase_ = true;
+    boundary_phase_start_time_ = this->now();
     RCLCPP_INFO(logger_,
       "Radiation source peak reached (gradient=%.4f). Starting boundary survey.", grad_mag);
   }
 
-  constexpr int    N_SURVEY_DIRS = 8;
+  // Time-budget alternative to radiation_survey_dirs_: rather than reducing
+  // angular coverage (found, smoke-tested 2026-07-21, to leave the zone
+  // under-characterized and produce fewer but much longer dwell episodes as
+  // the robot re-enters later), force-exit the survey once its own wall
+  // clock is spent, regardless of how many of the N_SURVEY_DIRS rays have
+  // been visited. Returning empty reuses the existing "boundary exhausted"
+  // path in makePlan() (rad_frontiers.empty() && radiation_in_boundary_phase_)
+  // rather than needing a separate exit condition. 0.0 (default) disables
+  // this and reproduces the original unbounded-time behavior exactly.
+  if (radiation_survey_time_cap_s_ > 0.0 &&
+    (this->now() - boundary_phase_start_time_).seconds() > radiation_survey_time_cap_s_)
+  {
+    RCLCPP_INFO(logger_,
+      "Boundary survey time cap (%.1fs) reached; treating zone as characterized.",
+      radiation_survey_time_cap_s_);
+    return {};
+  }
+
+  const int        N_SURVEY_DIRS = radiation_survey_dirs_;
   constexpr double SURVEY_MAX_M  = 15.0;
   constexpr double SURVEY_STEP_M = 0.5;
 
@@ -954,6 +1149,16 @@ void Explore::makePlan()
   }
   auto pose = pose_stamped.pose;
 
+  // Rolling position history for effectiveRadiationSeekScale()'s stall
+  // deficit: tracked directly from the robot's own pose every tick,
+  // independent of last_progress_/goal bookkeeping (see explore.h for why).
+  recent_positions_.emplace_back(this->now(), pose.position);
+  while (!recent_positions_.empty() &&
+    (this->now() - recent_positions_.front().first).seconds() > stall_window_s_)
+  {
+    recent_positions_.pop_front();
+  }
+
   // --- Stage 0: Danger Check (Radiation) ---
   // If in recovery, fully yield to local_recovery_node. Stop exploration
   // so both nodes don't contend for navigation goals simultaneously.
@@ -967,11 +1172,12 @@ void Explore::makePlan()
     return;
   }
 
-  if (current_radiation_rate_ > acute_dose_rate_mrem_hr_) {
+  if (current_radiation_rate_ > effectiveAcuteDoseThreshold()) {
     RCLCPP_WARN(
       logger_,
-      "Robot in ACUTE radiation zone (%.2f mR/hr). Stopping exploration, yielding to recovery node.",
-      current_radiation_rate_);
+      "Robot in ACUTE radiation zone (%.2f mR/hr, effective threshold %.2f). "
+      "Stopping exploration, yielding to recovery node.",
+      current_radiation_rate_, effectiveAcuteDoseThreshold());
     is_recovering_ = true;
     stop(false);
     return;
@@ -1013,19 +1219,47 @@ void Explore::makePlan()
     return;
   }
 
+  // A goal failure shortly after stuck_escape_node's own backup+Spin recovery
+  // completes is not necessarily evidence the frontier itself is bad -- it
+  // may be the same physical jam that made the robot stuck in the first
+  // place, now cleared, with the goal simply not having had a fair attempt
+  // since. Observed directly (via RViz): the last remaining frontier behind
+  // a tight corridor got blacklisted this way, no other candidate existed,
+  // no_frontier_retry exhausted, and the mission reported success having
+  // never entered an entire room. Give each goal one grace pass (tracked per
+  // goal via current_goal_given_stuck_grace_, reset in sendGoal()) before
+  // blacklisting it for a failure that falls within stuck_grace_window_s_ of
+  // the most recent stuck-escape event.
+  bool recent_stuck_recovery = last_stuck_recovery_time_.nanoseconds() > 0 &&
+    (this->now() - last_stuck_recovery_time_) < tf2::durationFromSec(stuck_grace_window_s_);
+
   bool is_current_goal_invalid = false;
   if (goal_active_) {
     // 1. Check for timeout
     if ((this->now() - last_progress_) > tf2::durationFromSec(progress_timeout_)) {
-      // Blacklist on timeout too, not just blocked/already-explored: without
-      // this, a goal that times out gets cancelled and immediately
-      // re-selected (frontier search doesn't otherwise know it's bad),
-      // producing a loop of the same goal timing out over and over.
-      RCLCPP_WARN(
-        logger_, "Active goal timed out. Blacklisting (%.2f, %.2f) and re-planning.",
-        last_sent_goal_position_.x, last_sent_goal_position_.y);
-      frontier_blacklist_.push_back(last_sent_goal_position_);
-      is_current_goal_invalid = true;
+      if (recent_stuck_recovery && !current_goal_given_stuck_grace_ &&
+        total_stuck_grace_count_ < kMaxStuckGraceTotal)
+      {
+        current_goal_given_stuck_grace_ = true;
+        total_stuck_grace_count_++;
+        RCLCPP_WARN(
+          logger_,
+          "Active goal to (%.2f, %.2f) timed out shortly after a stuck-escape recovery; "
+          "giving it one more uninterrupted attempt instead of blacklisting (grace %d/%d used).",
+          last_sent_goal_position_.x, last_sent_goal_position_.y,
+          total_stuck_grace_count_, kMaxStuckGraceTotal);
+        last_progress_ = this->now();
+      } else {
+        // Blacklist on timeout too, not just blocked/already-explored: without
+        // this, a goal that times out gets cancelled and immediately
+        // re-selected (frontier search doesn't otherwise know it's bad),
+        // producing a loop of the same goal timing out over and over.
+        RCLCPP_WARN(
+          logger_, "Active goal timed out. Blacklisting (%.2f, %.2f) and re-planning.",
+          last_sent_goal_position_.x, last_sent_goal_position_.y);
+        frontier_blacklist_.push_back(last_sent_goal_position_);
+        is_current_goal_invalid = true;
+      }
     }
     // 2. Check if current goal is now blocked OR already explored (no longer unknown)
     nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
@@ -1034,9 +1268,22 @@ void Explore::makePlan()
       unsigned char cost = costmap->getCost(mx, my);
       // If it's an obstacle (>= 253)
       if (cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-        RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting.");
-        frontier_blacklist_.push_back(last_sent_goal_position_);
-        is_current_goal_invalid = true;
+        if (recent_stuck_recovery && !current_goal_given_stuck_grace_ &&
+          total_stuck_grace_count_ < kMaxStuckGraceTotal)
+        {
+          current_goal_given_stuck_grace_ = true;
+          total_stuck_grace_count_++;
+          RCLCPP_WARN(
+            logger_,
+            "Current goal reads as blocked shortly after a stuck-escape recovery "
+            "(costmap may still reflect the close-range jam); giving it one more "
+            "attempt instead of blacklisting (grace %d/%d used).",
+            total_stuck_grace_count_, kMaxStuckGraceTotal);
+        } else {
+          RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting.");
+          frontier_blacklist_.push_back(last_sent_goal_position_);
+          is_current_goal_invalid = true;
+        }
       } else if (cost != nav2_costmap_2d::NO_INFORMATION) {
         // If it's already been explored, we only cancel if we are reasonably close to it.
         // This prevents 'target switching' loops where SLAM clears the goal area just before arrival.
@@ -1068,15 +1315,22 @@ void Explore::makePlan()
   double search_yaw = robot_yaw;
 
   double remaining_dose_budget = std::max(0.0, max_radiation_dose_ - cumulative_dose_);
+  // The point-lethality ceiling tracks the effective acute yield threshold
+  // (not the old fixed critical_dose_mrem_hr_ of 2.0): only destinations
+  // that would immediately re-trigger the acute cascade on arrival are
+  // hard-rejected; affordability of merely-elevated destinations is
+  // decided by the transit-dose gate inside frontierCost.
   auto frontiers = search_.searchFrom(
     pose.position, search_yaw, latest_battery_state_,
     initial_pose_.position, energy_per_meter_,
     battery_safety_margin_, battery_penalty_scale_,
     min_frontier_clearance_, latest_heatmap_,
     radiation_scale_, radiation_gradient_scale_,
-    critical_dose_mrem_hr_, explored_grid_,
+    effectiveAcuteDoseThreshold(), explored_grid_,
     goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point(),
-    remaining_dose_budget, dose_budget_scale_);
+    remaining_dose_budget, dose_budget_scale_,
+    effectiveFrontierSpendFraction(),
+    latest_heatmap_std_, effectiveRadiationSeekScale());
 
   // In radiation mode:
   // 1. Generate radiation frontiers (ascent phase or boundary survey phase).
@@ -1209,16 +1463,56 @@ void Explore::makePlan()
 
   // Handle no valid frontiers
   if (!found_target) {
+    // "Every remaining frontier is gated" (all infinite-cost: dose- or
+    // battery-infeasible) is a different map state from "no frontiers
+    // remain". The GP heatmap keeps refining as samples arrive, so a
+    // temporarily all-gated set can become eligible again; completing on
+    // the spot turned a hot spawn into an instant 0.0m "success". Hold
+    // completion while all-gated, up to all_gated_completion_timeout_s_.
+    bool all_gated = !frontiers.empty() &&
+      n_inf_cost == static_cast<int>(frontiers.size());
+    if (all_gated && !goal_active_) {
+      if (all_gated_since_.nanoseconds() == 0) {
+        all_gated_since_ = this->now();
+      }
+      double held = (this->now() - all_gated_since_).seconds();
+      if (held < all_gated_completion_timeout_s_) {
+        RCLCPP_WARN_THROTTLE(
+          logger_, *this->get_clock(), 10000,
+          "All %zu remaining frontiers are gated (dose/battery infeasible); "
+          "holding for estimate refinement (%.0fs of %.0fs) instead of "
+          "declaring completion.",
+          frontiers.size(), held, all_gated_completion_timeout_s_);
+        no_frontier_count_ = 0;
+        has_queued_target_ = false;
+        return;
+      }
+      RCLCPP_WARN(
+        logger_,
+        "All %zu remaining frontiers still gated after %.0fs; completing "
+        "mission with dose-foreclosed area unexplored.",
+        frontiers.size(), held);
+      all_gated_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      handleExplorationCompletion(true);
+      has_queued_target_ = false;
+      return;
+    }
+    all_gated_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     if (!goal_active_) {
       no_frontier_count_++;
       if (no_frontier_count_ >= no_frontier_retry_) {
         no_frontier_count_ = 0;
-        startVerification();
+        // Verification phase disabled: it was looping indefinitely
+        // (observed directly: robot circling outward search points forever,
+        // never reaching the return-to-origin step). Go straight to
+        // completion/return-to-origin once frontiers are truly exhausted.
+        handleExplorationCompletion(true);
       }
     }
     has_queued_target_ = false;
     return;
   }
+  all_gated_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
   // Final check for stopped_ flag before sending goal to prevent race with service calls
   if (stopped_) {
@@ -1282,6 +1576,7 @@ void Explore::sendGoal(const geometry_msgs::msg::Point & target, bool is_recalib
   prev_distance_ = std::numeric_limits<double>::infinity();
   no_frontier_count_ = 0;
   last_goal_successful_ = false;
+  current_goal_given_stuck_grace_ = false;
 }
 
 void Explore::handleExplorationCompletion(bool force_return)
@@ -1420,8 +1715,54 @@ void Explore::returnToInitialPose()
       goal_active_ = false;
       if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
         RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
+        return_to_pose_retry_count_ = 0;
+        return_to_pose_cancel_count_ = 0;
+        return;
+      }
+
+      RCLCPP_WARN(logger_, "Failed to return to initial pose: %d", static_cast<int>(result.code));
+
+      // Retry rather than leaving the robot idle with no active goal. A
+      // cancellation here is often just stuck_escape_node (or Nav2's own
+      // recovery) clearing a physical obstruction out of the way -- observed
+      // directly: without a retry, the robot ended up freed but permanently
+      // parked, since exploration_finished_ has already stopped the main
+      // planning timer that would otherwise resend a goal.
+      //
+      // CANCELED gets its own budget and a delay longer than the escape
+      // maneuver: counting it toward the ordinary retry cap let ten
+      // stuck-escape preemptions exhaust the budget while the robot was
+      // still making progress home (observed at (0.27, 0.13), 30cm from
+      // the goal), and the 3s retry re-sent the goal mid-escape, driving
+      // the robot back into the same jam.
+      bool canceled = (result.code == rclcpp_action::ResultCode::CANCELED);
+      bool budget_ok = canceled ?
+        (return_to_pose_cancel_count_ < kMaxReturnToPoseCancels) :
+        (return_to_pose_retry_count_ < kMaxReturnToPoseRetries);
+      if (budget_ok) {
+        double delay = canceled ? kReturnAfterCancelDelaySec : kReturnToPoseRetryDelaySec;
+        if (canceled) {
+          return_to_pose_cancel_count_++;
+          RCLCPP_WARN(logger_,
+            "Return goal preempted by a recovery maneuver (cancel %d/%d); "
+            "re-sending in %.1fs without consuming a retry.",
+            return_to_pose_cancel_count_, kMaxReturnToPoseCancels, delay);
+        } else {
+          return_to_pose_retry_count_++;
+          RCLCPP_WARN(logger_, "Retrying return to initial pose (%d/%d) in %.1fs.",
+            return_to_pose_retry_count_, kMaxReturnToPoseRetries, delay);
+        }
+        return_to_pose_retry_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(delay),
+          [this]() {
+            return_to_pose_retry_timer_->cancel();
+            returnToInitialPose();
+          });
       } else {
-        RCLCPP_WARN(logger_, "Failed to return to initial pose: %d", static_cast<int>(result.code));
+        // Keep this exact phrasing: run_trial.py's GIVEUP_RE keys on it.
+        RCLCPP_ERROR(logger_,
+          "Failed to return to initial pose after %d retries. Giving up.",
+          canceled ? kMaxReturnToPoseCancels : kMaxReturnToPoseRetries);
       }
     };
 
@@ -1714,6 +2055,15 @@ void Explore::start()
   has_last_trajectory_ = false;
   goal_active_ = false;
   waiting_for_goal_response_ = false;
+  // last_progress_ is otherwise only set at construction and by later
+  // navigation-progress events; without resetting it here, the staged
+  // bring-up delay between construction and this call (~70s) already
+  // exceeds progress_timeout_ (30s default) by the time the first planning
+  // tick runs, spuriously blacklisting the very first goal as timed out.
+  // (This used to also corrupt effectiveRadiationSeekScale()'s stall ramp,
+  // before that was moved onto its own independent recent_positions_
+  // history -- see explore.h.)
+  last_progress_ = this->now();
   RCLCPP_INFO(logger_, "Exploration started.");
 }
 
@@ -1749,6 +2099,9 @@ void Explore::resume()
   recalibration_requested_ = false;
   recalibrating_ = false;
   current_goal_is_recalibration_ = false;
+  // Same rationale as start(): don't let time spent stopped count against
+  // the goal-timeout clock once exploration resumes.
+  last_progress_ = this->now();
   RCLCPP_INFO(logger_, "Exploration resuming.");
   // Reactivate the timer
   exploring_timer_->reset();

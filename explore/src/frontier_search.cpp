@@ -45,11 +45,14 @@ FrontierSearch::searchFrom(
   const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
-  double critical_dose_mrem_hr,
+  double lethal_point_ceiling_mrem_hr,
   const cv::Mat & explored_grid,
   const geometry_msgs::msg::Point & current_goal,
   double remaining_dose_budget,
-  double dose_budget_scale)
+  double dose_budget_scale,
+  double frontier_spend_fraction,
+  const cv::Mat & heatmap_std,
+  double radiation_seek_scale)
 {
   std::vector<Frontier> frontier_list;
 
@@ -159,8 +162,9 @@ FrontierSearch::searchFrom(
       frontier, robot_yaw, battery_state, position, home_pos,
       energy_per_meter, battery_safety_margin, battery_penalty_scale,
       heatmap, radiation_scale, radiation_gradient_scale,
-      critical_dose_mrem_hr, explored_grid, current_goal,
-      remaining_dose_budget, dose_budget_scale);
+      lethal_point_ceiling_mrem_hr, explored_grid, current_goal,
+      remaining_dose_budget, dose_budget_scale, frontier_spend_fraction,
+      heatmap_std, radiation_seek_scale);
   }
 
   // --- Frontier Clustering ("Mean Frontier Candidate") ---
@@ -215,8 +219,9 @@ FrontierSearch::searchFrom(
           cluster, robot_yaw, battery_state, position, home_pos,
           energy_per_meter, battery_safety_margin, battery_penalty_scale,
           heatmap, radiation_scale, radiation_gradient_scale,
-          critical_dose_mrem_hr, explored_grid, current_goal,
-          remaining_dose_budget, dose_budget_scale);
+          lethal_point_ceiling_mrem_hr, explored_grid, current_goal,
+          remaining_dose_budget, dose_budget_scale, frontier_spend_fraction,
+          heatmap_std, radiation_seek_scale);
     }
     frontier_list = clustered_list;
   }
@@ -395,11 +400,14 @@ double FrontierSearch::frontierCost(
   const cv::Mat & heatmap,
   double radiation_scale,
   double radiation_gradient_scale,
-  double critical_dose_mrem_hr,
+  double lethal_point_ceiling_mrem_hr,
   const cv::Mat & explored_grid,
   const geometry_msgs::msg::Point & current_goal,
   double remaining_dose_budget,
-  double dose_budget_scale)
+  double dose_budget_scale,
+  double frontier_spend_fraction,
+  const cv::Mat & heatmap_std,
+  double radiation_seek_scale)
 {
   frontier.info_gain = 0.0;
   // Battery feasibility check.
@@ -502,18 +510,31 @@ double FrontierSearch::frontierCost(
   // Radiation-informed Cost (Request 1)
   // Compute worldToMap for centroid once and reuse for both the critical-dose
   // check and the radiation cost calculation below.
+  // Point-lethality checks below use lethal_point_ceiling_mrem_hr, an
+  // acute-level ceiling (the caller passes its effective acute-dose yield
+  // threshold), NOT the old critical_dose_mrem_hr (2.0). Gating destinations
+  // at 2.0 mrem/hr was incoherent with the mission's budget framing: against
+  // a 100 mrem budget, 2.0 mrem/hr is 0.03% of budget per minute -- the robot
+  // could dwell there for 50 hours before exhausting it -- yet the point-gate
+  // foreclosed such frontiers, and everything behind them, permanently
+  // (observed directly: a ~16 mrem/hr spawn painted every frontier past the
+  // gate and the mission declared itself complete at 0.0m traveled).
+  // Affordability against the actual budget is enforced by the transit-dose
+  // gate further down; the point ceiling only rejects destinations that
+  // would immediately re-trigger the acute yield/recovery cascade on arrival.
   double radiation_at_centroid = 0.0;
   double rad_cost = 0;
+  double seek_bonus = 0.0;
   if (!heatmap.empty()) {
     unsigned int mx, my;
-    // Check critical dose at centroid (computed once, reused below)
+    // Check lethal point ceiling at centroid (computed once, reused below)
     bool centroid_in_map = costmap_->worldToMap(
       frontier.centroid.x, frontier.centroid.y, mx, my);
     if (centroid_in_map) {
       int row = (heatmap.rows - 1) - my;
       if (mx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
         float radiation = heatmap.at<float>(row, mx);
-        if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+        if (radiation >= lethal_point_ceiling_mrem_hr) {return std::numeric_limits<double>::infinity();}
       }
     }
     {
@@ -522,7 +543,7 @@ double FrontierSearch::frontierCost(
         int row = (heatmap.rows - 1) - mmy;
         if (mmx < (unsigned int)heatmap.cols && row >= 0 && row < heatmap.rows) {
           float radiation = heatmap.at<float>(row, mmx);
-          if (radiation >= critical_dose_mrem_hr) {return std::numeric_limits<double>::infinity();}
+          if (radiation >= lethal_point_ceiling_mrem_hr) {return std::numeric_limits<double>::infinity();}
         }
       }
     }
@@ -537,8 +558,7 @@ double FrontierSearch::frontierCost(
         float radiation = heatmap.at<float>(row, h_x);
         radiation_at_centroid = static_cast<double>(radiation);
 
-        // If radiation exceeds critical threshold, this frontier is lethal/invalid
-        if (radiation >= critical_dose_mrem_hr) {
+        if (radiation >= lethal_point_ceiling_mrem_hr) {
           return std::numeric_limits<double>::infinity();
         }
 
@@ -575,19 +595,58 @@ double FrontierSearch::frontierCost(
             rad_cost += radiation_gradient_scale * (grad_x * dx + grad_y * dy);
           }
         }
+
+        // Radiation-seeking bonus (information-gain framing, Request: make
+        // frontier selection actually radiation-driven rather than only
+        // radiation-averse). Rewards frontiers that are BOTH elevated above
+        // background AND still uncertain in the GP's own estimate, so the
+        // robot is drawn to linger near an unconfirmed source long enough to
+        // actually localize it, rather than brushing past it once on the way
+        // to the next spatial frontier. Deliberately fades to ~0 once a
+        // region is either back at background (elevation term vanishes,
+        // nothing there) or the GP has converged on it (std term vanishes,
+        // already characterized) -- it cannot indefinitely trap the robot
+        // orbiting an already-found source, and it never touches the
+        // lethal-point or dose-budget hard gates above, which remain the
+        // final word on safety regardless of this term. rad_cost's own
+        // quadratic-above-threshold growth naturally outpaces this bonus's
+        // linear growth as radiation climbs, so the net effect tapers off
+        // well before the hard ceiling -- seek moderate, uncharacterized
+        // signal; let the existing avoidance machinery still win as it gets
+        // genuinely dangerous.
+        if (radiation_seek_scale != 0.0 && !heatmap_std.empty() &&
+          h_x >= 0 && h_x < heatmap_std.cols && h_y >= 0 && h_y < heatmap_std.rows)
+        {
+          float std_at_centroid = heatmap_std.at<float>(row, h_x);
+          double elevation = std::max(0.0, radiation_at_centroid - warning_thresh);
+          seek_bonus = -radiation_seek_scale * elevation * static_cast<double>(std_at_centroid);
+          // Cap at 25% of this frontier's own distance cost (mirrors
+          // size_gain's cap): can reorder preference among already-safe,
+          // already-affordable frontiers, but a far, merely-curious
+          // frontier can never beat a close one purely on radiological
+          // interest.
+          double max_seek_benefit = potential_scale_ * frontier.min_distance * 0.25;
+          seek_bonus = std::max(seek_bonus, -max_seek_benefit);
+        }
       }
     }
   }
 
   // Dose-budget feasibility and efficiency cost.
-  // A frontier is infeasible if the estimated transit dose would exceed the remaining budget.
-  // This lets the robot re-enter previously evacuated areas when budget still permits.
+  // The affordability question that actually matters for coverage: what
+  // dose does *visiting* this frontier cost, and is that an acceptable
+  // spend of what remains? Round trip (out and back), since the mission
+  // must still come home within budget. frontier_spend_fraction caps how
+  // much of the remaining budget a single frontier visit may consume; the
+  // caller scales it with the dose-budget-relaxation coefficient k, making
+  // k the "how freely may budget be spent per target" knob rather than
+  // only a retreat-trigger nudge.
   double dose_budget_cost = 0.0;
   if (remaining_dose_budget < std::numeric_limits<double>::infinity()) {
     constexpr double robot_speed_mps = 0.5;  // conservative estimate
-    double transit_time_hr = (frontier.min_distance / robot_speed_mps) / 3600.0;
-    double expected_transit_dose = radiation_at_centroid * transit_time_hr;
-    if (expected_transit_dose > remaining_dose_budget) {
+    double round_trip_time_hr = (2.0 * frontier.min_distance / robot_speed_mps) / 3600.0;
+    double expected_transit_dose = radiation_at_centroid * round_trip_time_hr;
+    if (expected_transit_dose > frontier_spend_fraction * remaining_dose_budget) {
       return std::numeric_limits<double>::infinity();
     }
     if (remaining_dose_budget > 0.0 && expected_transit_dose > 0.0) {
@@ -654,7 +713,7 @@ double FrontierSearch::frontierCost(
     }
   }
 
-  return original_cost + info_gain_cost + rad_cost + dose_budget_cost + orientation_penalty +
-         battery_penalty + hysteresis_bonus;
+  return original_cost + info_gain_cost + rad_cost + seek_bonus + dose_budget_cost +
+         orientation_penalty + battery_penalty + hysteresis_bonus;
 }
 }  // namespace frontier_exploration

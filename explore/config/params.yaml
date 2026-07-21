@@ -23,9 +23,21 @@
     battery_penalty_scale: 1.0
     max_battery_used: 0.8
     max_radiation_dose: 100.0
+    # critical_dose_mrem_hr no longer hard-gates frontier targeting (kept for
+    # the safe-zone/cost semantics elsewhere); the frontier point-lethality
+    # ceiling now tracks the effective acute threshold, and affordability is
+    # decided by the transit-dose gate (frontier_dose_spend_fraction).
     critical_dose_mrem_hr: 2.0
     acute_dose_rate_mrem_hr: 10.0
     dose_budget_scale: 10.0
+    # Max fraction of the remaining dose budget one frontier visit (round
+    # trip at the predicted centroid dose rate) may cost; relaxed by
+    # dose_budget_relaxation_k like the thresholds.
+    frontier_dose_spend_fraction: 0.05
+    # How long to hold mission completion while every remaining frontier is
+    # gated (dose/battery infeasible), giving the GP estimate time to refine,
+    # before conceding and completing with foreclosed area unexplored.
+    all_gated_completion_timeout_s: 180.0
     safe_dose_threshold_mrem_hr: 1.0
     radiation_topic: rad
     heatmap_topic: /rad_heatmap/raw_mean_map

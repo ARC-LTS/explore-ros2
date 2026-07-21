@@ -60,6 +60,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <opencv2/opencv.hpp>
@@ -152,8 +153,40 @@ private:
     rclcpp::Subscription < sensor_msgs::msg::Image > ::SharedPtr heatmap_sub_;
     void heatmapCallback(const sensor_msgs::msg::Image::SharedPtr msg);
 
+    rclcpp::Subscription < sensor_msgs::msg::Image > ::SharedPtr heatmap_std_sub_;
+    void heatmapStdCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+
     rclcpp::Subscription < geometry_msgs::msg::PointStamped > ::SharedPtr stable_source_sub_;
     void stableSourceCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
+
+    // stuck_escape_node publishes here once its own backup+Spin recovery
+    // sequence completes. A goal that fails (timeout or costmap-blocked)
+    // shortly after one of these is not evidence the frontier itself is bad
+    // -- it may just be the same physical jam that made the robot stuck in
+    // the first place, now resolved, with the goal simply not having had a
+    // fair, uninterrupted attempt yet. See makePlan()'s stuck-grace check.
+    rclcpp::Subscription < std_msgs::msg::Float64 > ::SharedPtr stuck_escape_event_sub_;
+    void stuckEscapeEventCallback(const std_msgs::msg::Float64::SharedPtr msg);
+    rclcpp::Time last_stuck_recovery_time_{0, 0, RCL_ROS_TIME};
+    double stuck_grace_window_s_;
+    // Reset in sendGoal() for every new goal; sending an early-return "one
+    // grace pass and done" per goal avoids the grace check masking a
+    // genuinely bad frontier forever if stuck-escapes keep recurring at the
+    // same point.
+    bool current_goal_given_stuck_grace_ = false;
+    // Global (not per-goal) cap on total grace passes for the whole mission.
+    // Without this, a robot physically wedged in one trap that keeps
+    // targeting a slightly different nearby frontier candidate each time it
+    // frees itself gets a fresh per-goal grace pass on every single one of
+    // those candidates, so no individual point ever accumulates the two
+    // failures needed to actually get blacklisted -- observed directly: 17
+    // grace passes and zero blacklist events in one trial, 48 stuck events,
+    // 5m of net progress, full wall-clock cap. This cap ensures the
+    // mechanism can rescue a handful of genuinely unlucky one-off frontiers
+    // without being able to indefinitely forestall blacklisting an entire
+    // trap region.
+    static constexpr int kMaxStuckGraceTotal = 3;
+    int total_stuck_grace_count_ = 0;
 
     std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
@@ -182,10 +215,70 @@ private:
     sensor_msgs::msg::BatteryState latest_battery_state_;
     double cumulative_dose_ = 0.0;
     rclcpp::Time last_radiation_update_;
+
+    // Dose-budget-aware relaxation of acute_dose_rate_mrem_hr_, using the
+    // identical formula as local_recovery_node and rad_safety_monitor_node.
+    // This node MUST relax whenever they do: its acute check is a "stop and
+    // yield to the recovery node" handoff, and is_recovering_ is only ever
+    // cleared by local_recovery_node calling /explore_node/start. If this
+    // node stops at the fixed threshold while the recovery nodes' relaxed
+    // triggers sit above the current dose rate, nobody ever comes -- the
+    // robot idles in the dead band accumulating dose until the mission
+    // budget expires (observed directly across the k>0 pilot arms: trials
+    // parked with zero stuck events and near-zero distance). k=0 reproduces
+    // the fixed threshold exactly.
+    double dose_budget_relaxation_k_ = 0.0;
+    double dose_budget_ceiling_mult_ = 2.0;
+    double effectiveAcuteDoseThreshold();
+    // Shared relaxation multiplier: authority fraction when fresh, own
+    // integration otherwise (see the definition for the contract argument).
+    double currentBudgetMultiplier();
+    double authority_fraction_ = -1.0;
+    rclcpp::Time authority_fraction_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Subscription < std_msgs::msg::Float64 > ::SharedPtr budget_authority_sub_;
+    rclcpp::Publisher < std_msgs::msg::Float64 > ::SharedPtr multiplier_pub_;
+    rclcpp::TimerBase::SharedPtr multiplier_timer_;
+
+    // Transit-dose frontier gating: the base fraction of the remaining dose
+    // budget a single frontier visit may cost (see frontier_search's
+    // frontierCost), relaxed by the same k/ceiling family as the thresholds
+    // above so k acts as the budget-spend knob at the targeting layer too.
+    double frontier_dose_spend_fraction_ = 0.05;
+    double effectiveFrontierSpendFraction();
+
+    // "Every remaining frontier is currently gated" is not the same map
+    // state as "no frontiers remain": the GP heatmap keeps refining as
+    // samples arrive, so a temporarily all-gated frontier set can become
+    // partially eligible again. Hold completion while in that state, up to
+    // this timeout, instead of declaring the mission complete on the spot
+    // (observed directly: a hot spawn gated every frontier and the mission
+    // reported success at 0.0m traveled).
+    double all_gated_completion_timeout_s_ = 180.0;
+    rclcpp::Time all_gated_since_{0, 0, RCL_ROS_TIME};
     int frontiers_explored_count_ = 0;
     bool is_verifying_ = false;
     int verification_attempts_ = 0;
     void returnToInitialPose(void);
+
+    // Retry state for returnToInitialPose(): a cancellation (e.g. from
+    // stuck_escape_node clearing a physical obstruction) is not necessarily
+    // a bad path, only an interrupted attempt. Without a retry, the robot
+    // ends up freed but idle forever once exploration_finished_ has already
+    // stopped the main planning timer that would otherwise resend a goal.
+    static constexpr int kMaxReturnToPoseRetries = 10;
+    static constexpr double kReturnToPoseRetryDelaySec = 3.0;
+    // A CANCELED result is stuck_escape_node preempting the goal to run its
+    // ~10s backup-and-spin; it says nothing about whether home is reachable,
+    // so it must not consume the retry budget. The retry also has to wait
+    // out the escape maneuver, or the re-sent goal races it and drives the
+    // robot straight back into the same jam. The cancel cap bounds a robot
+    // that is permanently wedged (the trial wallclock cap is the final
+    // backstop).
+    static constexpr int kMaxReturnToPoseCancels = 40;
+    static constexpr double kReturnAfterCancelDelaySec = 12.0;
+    int return_to_pose_retry_count_ = 0;
+    int return_to_pose_cancel_count_ = 0;
+    rclcpp::TimerBase::SharedPtr return_to_pose_retry_timer_;
 
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr start_exploration_service_;
     rclcpp::Service < std_srvs::srv::Trigger > ::SharedPtr stop_exploration_service_;
@@ -257,15 +350,46 @@ private:
     // radiation parameters
     std::string radiation_topic_;
     std::string heatmap_topic_;
+    std::string heatmap_std_topic_;
     double max_radiation_dose_;
     double radiation_scale_;
     double radiation_gradient_scale_;
+    double radiation_seek_scale_;
+    bool radiation_seek_adaptive_;     // scale seek_bonus by a stall deficit instead of a constant
+    int radiation_survey_dirs_;        // boundary-survey ray count (default 8)
+    double radiation_survey_time_cap_s_;  // boundary-survey time budget (0.0 = disabled)
     double critical_dose_mrem_hr_;     // cost-function penalty threshold
     double acute_dose_rate_mrem_hr_;   // hard stop: triggers evacuation + blacklist
     double dose_budget_scale_;
     double safe_dose_threshold_mrem_hr_;
     double current_radiation_rate_ = 0.0;
     bool is_recovering_ = false;
+
+    // Effective seek scale for the current planning tick: either the raw
+    // constant radiation_seek_scale_ (radiation_seek_adaptive_ == false) or
+    // that constant scaled by a stall deficit computed directly from recent
+    // net displacement (see recent_positions_), near-zero during healthy
+    // exploration and ramping toward 1.0 as the robot genuinely fails to
+    // get anywhere. Deliberately independent of last_progress_/
+    // progress_timeout_ -- an earlier version used that timer and was found
+    // (seek-adaptive smoke test, 2026-07-21) to be an unreliable stall
+    // proxy, since many unrelated code paths reset it (goal-sent, Nav2
+    // recovery, stuck-escape grace), so it could read "healthy" during a
+    // mission that was macroscopically going nowhere.
+    double effectiveRadiationSeekScale();
+
+    // Rolling (time, position) history used by effectiveRadiationSeekScale().
+    // Updated once per makePlan() tick, pruned to stall_window_s_.
+    std::deque<std::pair<rclcpp::Time, geometry_msgs::msg::Point>> recent_positions_;
+    double stall_window_s_;
+    double stall_min_displacement_m_;
+
+    // Wall-clock start of the current boundary-survey (RADIATION mode
+    // Phase 2) episode, set once per fresh entry; used by
+    // getRadiationFrontiers() to force-exit the survey once
+    // radiation_survey_time_cap_s_ elapses, regardless of how many of the
+    // radiation_survey_dirs_ rays have been visited.
+    rclcpp::Time boundary_phase_start_time_;
 
     enum class ExplorationMode { SPATIAL, RADIATION };
     ExplorationMode exploration_mode_ = ExplorationMode::SPATIAL;
@@ -300,6 +424,7 @@ private:
     std::vector<frontier_exploration::Frontier> generateRadiationFrontiers();
 
     cv::Mat latest_heatmap_;
+    cv::Mat latest_heatmap_std_;
 
     // Explored area tracking
     cv::Mat explored_grid_;

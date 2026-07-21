@@ -65,11 +65,14 @@ public:
       const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
-      double critical_dose_mrem_hr = 2.0,
+      double lethal_point_ceiling_mrem_hr = 10.0,
       const cv::Mat & explored_grid = cv::Mat(),
       const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
       double remaining_dose_budget = std::numeric_limits<double>::infinity(),
-      double dose_budget_scale = 10.0);
+      double dose_budget_scale = 10.0,
+      double frontier_spend_fraction = 1.0,
+      const cv::Mat & heatmap_std = cv::Mat(),
+      double radiation_seek_scale = 0.0);
 
 protected:
     /**
@@ -121,11 +124,14 @@ protected:
       const cv::Mat & heatmap = cv::Mat(),
       double radiation_scale = 0.0,
       double radiation_gradient_scale = 0.0,
-      double critical_dose_mrem_hr = 2.0,
+      double lethal_point_ceiling_mrem_hr = 10.0,
       const cv::Mat & explored_grid = cv::Mat(),
       const geometry_msgs::msg::Point & current_goal = geometry_msgs::msg::Point(),
       double remaining_dose_budget = std::numeric_limits<double>::infinity(),
-      double dose_budget_scale = 10.0);
+      double dose_budget_scale = 10.0,
+      double frontier_spend_fraction = 1.0,
+      const cv::Mat & heatmap_std = cv::Mat(),
+      double radiation_seek_scale = 0.0);
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;
