@@ -72,7 +72,9 @@ public:
       double dose_budget_scale = 10.0,
       double frontier_spend_fraction = 1.0,
       const cv::Mat & heatmap_std = cv::Mat(),
-      double radiation_seek_scale = 0.0);
+      double radiation_seek_scale = 0.0,
+      const std::vector<geometry_msgs::msg::Point> & recent_trap_locations = {},
+      double trap_avoid_radius_m = 0.0);
 
 protected:
     /**
@@ -131,7 +133,9 @@ protected:
       double dose_budget_scale = 10.0,
       double frontier_spend_fraction = 1.0,
       const cv::Mat & heatmap_std = cv::Mat(),
-      double radiation_seek_scale = 0.0);
+      double radiation_seek_scale = 0.0,
+      const std::vector<geometry_msgs::msg::Point> & recent_trap_locations = {},
+      double trap_avoid_radius_m = 0.0);
 
 private:
     nav2_costmap_2d::Costmap2D * costmap_;

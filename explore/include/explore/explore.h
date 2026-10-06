@@ -169,6 +169,15 @@ private:
     void stuckEscapeEventCallback(const std_msgs::msg::Float64::SharedPtr msg);
     rclcpp::Time last_stuck_recovery_time_{0, 0, RCL_ROS_TIME};
     double stuck_grace_window_s_;
+
+    // Robot position at each stuck-escape event, aged out after
+    // radiation_seek_trap_window_s_, so frontierCost() can deny the seek
+    // bonus (see effectiveRadiationSeekScale()'s header comment for the
+    // failure mode this addresses) to any frontier near a location the
+    // robot has recently, repeatedly failed to get past.
+    std::deque<std::pair<rclcpp::Time, geometry_msgs::msg::Point>> recent_trap_locations_;
+    double radiation_seek_trap_avoid_radius_m_;
+    double radiation_seek_trap_window_s_;
     // Reset in sendGoal() for every new goal; sending an early-return "one
     // grace pass and done" per goal avoids the grace check masking a
     // genuinely bad frontier forever if stuck-escapes keep recurring at the
@@ -188,11 +197,24 @@ private:
     static constexpr int kMaxStuckGraceTotal = 3;
     int total_stuck_grace_count_ = 0;
 
-    std::vector < geometry_msgs::msg::Point > frontier_blacklist_;
+    // Each entry is (time added, point). The timestamp lets goalOnBlacklist()
+    // expire stale entries after blacklist_ttl_s_ so a frontier ruled out once
+    // (transient block / one timed-out approach) can be retried, instead of the
+    // blacklist growing without bound and eventually stranding residual
+    // frontiers (the vp_blacklisted premature-completion path). ttl <= 0 keeps
+    // entries permanent, reproducing the original behavior exactly.
+    std::vector<std::pair<rclcpp::Time, geometry_msgs::msg::Point>> frontier_blacklist_;
     geometry_msgs::msg::Point prev_goal_;
     double prev_distance_;
     int last_recovery_count_ = 0;
     rclcpp::Time last_progress_;
+    // Robot position where progress was last credited. The feedbackCallback
+    // ratchet only credits progress when Nav2's remaining path hits a new
+    // minimum; makePlan() also credits it whenever the robot has physically
+    // advanced progress_min_motion_m_ from here, so a legitimate detour or a
+    // Nav2 replan that lengthens the path is not mistaken for a stall.
+    geometry_msgs::msg::Point last_progress_pos_;
+    bool has_last_progress_pos_ = false;
     size_t last_markers_count_;
 
     // Set by feedbackCallback when Nav2's recovery count increases; consumed
@@ -313,6 +335,8 @@ private:
     double obstacle_penalty_scale_;
     double frontier_clustering_distance_;
     double progress_timeout_;
+    double progress_min_motion_m_;
+    double blacklist_ttl_s_;
     double min_frontier_clearance_;
     bool visualize_;
     bool return_to_init_;

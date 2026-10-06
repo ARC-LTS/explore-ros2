@@ -79,6 +79,19 @@ Explore::Explore()
   bool auto_start;
   this->declare_parameter<double>("planner_frequency", 1.0);
   this->declare_parameter<double>("progress_timeout", 30.0);
+  // A committed goal is credited with progress (its stall timer reset) whenever
+  // the robot physically advances this far from where progress was last
+  // credited, even if Nav2's remaining-path distance is momentarily rising
+  // (detour / replan). Set to 0 to disable and fall back to the pure
+  // distance_remaining ratchet.
+  this->declare_parameter<double>("progress_min_motion_m", 0.5);
+  // Seconds after which a blacklisted frontier point is eligible again, so an
+  // accumulating blacklist can no longer strand the last residual frontiers and
+  // complete the mission early with the map partly covered (the diagnosed
+  // vp_blacklisted premature-completion). 0.0 (default) keeps entries permanent,
+  // reproducing every trial to date exactly; set > 0 for the coverage-recovery
+  // configuration.
+  this->declare_parameter<double>("blacklist_ttl_s", 0.0);
   this->declare_parameter<bool>("visualize", false);
   this->declare_parameter<double>("potential_scale", 1.0);
   this->declare_parameter<double>("orientation_scale", 10.0);
@@ -124,6 +137,11 @@ Explore::Explore()
   // (partially) stalled.
   this->declare_parameter<double>("stall_window_s", 30.0);
   this->declare_parameter<double>("stall_min_displacement_m", 1.0);
+  // Deny the seek bonus within this radius of a recent stuck-escape
+  // location (see stuckEscapeEventCallback()/recent_trap_locations_).
+  // 0.0 (default) disables trap avoidance and reproduces prior behavior.
+  this->declare_parameter<double>("radiation_seek_trap_avoid_radius_m", 0.0);
+  this->declare_parameter<double>("radiation_seek_trap_window_s", 300.0);
   // Boundary-survey ray count (Phase 2 of RADIATION mode): fewer rays means
   // fewer elevated-zone approach goals and therefore less mission time spent
   // above the safe-dose threshold characterizing a source's extent, at the
@@ -147,6 +165,8 @@ Explore::Explore()
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
+  this->get_parameter("progress_min_motion_m", progress_min_motion_m_);
+  this->get_parameter("blacklist_ttl_s", blacklist_ttl_s_);
   this->get_parameter("visualize", visualize_);
   this->get_parameter("potential_scale", potential_scale_);
   this->get_parameter("orientation_scale", orientation_scale_);
@@ -179,6 +199,8 @@ Explore::Explore()
   this->get_parameter("radiation_seek_adaptive", radiation_seek_adaptive_);
   this->get_parameter("stall_window_s", stall_window_s_);
   this->get_parameter("stall_min_displacement_m", stall_min_displacement_m_);
+  this->get_parameter("radiation_seek_trap_avoid_radius_m", radiation_seek_trap_avoid_radius_m_);
+  this->get_parameter("radiation_seek_trap_window_s", radiation_seek_trap_window_s_);
   this->get_parameter("radiation_survey_dirs", radiation_survey_dirs_);
   this->get_parameter("radiation_survey_time_cap_s", radiation_survey_time_cap_s_);
   this->get_parameter("max_verification_attempts", max_verification_attempts_);
@@ -541,7 +563,7 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
         logger_,
         "ACUTE radiation (%.2f mR/hr) at (%.2f, %.2f). Blacklisting and evacuating.",
         current_radiation_rate_, last_sent_goal_position_.x, last_sent_goal_position_.y);
-      frontier_blacklist_.push_back(last_sent_goal_position_);
+      frontier_blacklist_.push_back({this->now(), last_sent_goal_position_});
     }
     is_recovering_ = true;
     has_queued_target_ = false;
@@ -685,6 +707,22 @@ void Explore::stableSourceCallback(const geometry_msgs::msg::PointStamped::Share
 void Explore::stuckEscapeEventCallback(const std_msgs::msg::Float64::SharedPtr /*msg*/)
 {
   last_stuck_recovery_time_ = this->now();
+
+  // Record where the robot actually was when it got stuck, so the seek
+  // bonus can avoid re-reinforcing a goal in the same direction (see
+  // recent_trap_locations_ in explore.h). Best-effort: if the pose lookup
+  // fails here, this stuck event just isn't remembered as a trap, which is
+  // no worse than the behavior before this mechanism existed.
+  geometry_msgs::msg::PoseStamped pose_stamped;
+  if (costmap_client_.getRobotPose(pose_stamped)) {
+    recent_trap_locations_.emplace_back(this->now(), pose_stamped.pose.position);
+  }
+  while (!recent_trap_locations_.empty() &&
+    (this->now() - recent_trap_locations_.front().first).seconds() >
+      radiation_seek_trap_window_s_)
+  {
+    recent_trap_locations_.pop_front();
+  }
 }
 
 void Explore::updateExploredArea()
@@ -1159,6 +1197,23 @@ void Explore::makePlan()
     recent_positions_.pop_front();
   }
 
+  // Motion-based progress credit. feedbackCallback only resets last_progress_
+  // when Nav2's remaining-path distance hits a new minimum, so a legitimate
+  // detour around an obstacle (or a Nav2 replan that temporarily lengthens the
+  // path) reads as a stall and the frontier gets blacklisted and abandoned
+  // mid-route even while the robot is actively driving toward it. Credit
+  // progress whenever the robot has physically advanced progress_min_motion_m_
+  // from where progress was last credited; a robot genuinely wedged or idle
+  // accumulates no net motion and still trips the progress_timeout_ backstop.
+  if (goal_active_ && has_last_progress_pos_ && progress_min_motion_m_ > 0.0) {
+    double dx = pose.position.x - last_progress_pos_.x;
+    double dy = pose.position.y - last_progress_pos_.y;
+    if (dx * dx + dy * dy > progress_min_motion_m_ * progress_min_motion_m_) {
+      last_progress_ = this->now();
+      last_progress_pos_ = pose.position;
+    }
+  }
+
   // --- Stage 0: Danger Check (Radiation) ---
   // If in recovery, fully yield to local_recovery_node. Stop exploration
   // so both nodes don't contend for navigation goals simultaneously.
@@ -1257,7 +1312,7 @@ void Explore::makePlan()
         RCLCPP_WARN(
           logger_, "Active goal timed out. Blacklisting (%.2f, %.2f) and re-planning.",
           last_sent_goal_position_.x, last_sent_goal_position_.y);
-        frontier_blacklist_.push_back(last_sent_goal_position_);
+        frontier_blacklist_.push_back({this->now(), last_sent_goal_position_});
         is_current_goal_invalid = true;
       }
     }
@@ -1281,7 +1336,7 @@ void Explore::makePlan()
             total_stuck_grace_count_, kMaxStuckGraceTotal);
         } else {
           RCLCPP_INFO(logger_, "Current goal blocked. Blacklisting.");
-          frontier_blacklist_.push_back(last_sent_goal_position_);
+          frontier_blacklist_.push_back({this->now(), last_sent_goal_position_});
           is_current_goal_invalid = true;
         }
       } else if (cost != nav2_costmap_2d::NO_INFORMATION) {
@@ -1296,7 +1351,7 @@ void Explore::makePlan()
             logger_,
             "Current goal area already explored by sensors and reached. Switching targets.");
           // Blacklist the reached goal to prevent immediate re-targeting of the same spot
-          frontier_blacklist_.push_back(last_sent_goal_position_);
+          frontier_blacklist_.push_back({this->now(), last_sent_goal_position_});
           is_current_goal_invalid = true;
         }
       }
@@ -1320,6 +1375,12 @@ void Explore::makePlan()
   // that would immediately re-trigger the acute cascade on arrival are
   // hard-rejected; affordability of merely-elevated destinations is
   // decided by the transit-dose gate inside frontierCost.
+  std::vector<geometry_msgs::msg::Point> trap_locations;
+  trap_locations.reserve(recent_trap_locations_.size());
+  for (const auto & trap : recent_trap_locations_) {
+    trap_locations.push_back(trap.second);
+  }
+
   auto frontiers = search_.searchFrom(
     pose.position, search_yaw, latest_battery_state_,
     initial_pose_.position, energy_per_meter_,
@@ -1330,7 +1391,8 @@ void Explore::makePlan()
     goal_active_ ? last_sent_goal_position_ : geometry_msgs::msg::Point(),
     remaining_dose_budget, dose_budget_scale_,
     effectiveFrontierSpendFraction(),
-    latest_heatmap_std_, effectiveRadiationSeekScale());
+    latest_heatmap_std_, effectiveRadiationSeekScale(),
+    trap_locations, radiation_seek_trap_avoid_radius_m_);
 
   // In radiation mode:
   // 1. Generate radiation frontiers (ascent phase or boundary survey phase).
@@ -1401,6 +1463,12 @@ void Explore::makePlan()
       latest_battery_state_.percentage);
   }
 
+  // Frontier-rejection tally for the completion diagnostic below. Meaningful
+  // when the loop exhausts every frontier without finding a target: it names
+  // WHY the explorer is about to declare completion (blacklisted/unreachable vs
+  // genuinely no frontiers left).
+  int n_blacklist = 0, n_pursuing = 0, n_too_close = 0, n_no_viewpoint = 0, n_vp_blacklist = 0;
+
   while (frontier_it != frontiers.end()) {
     const auto & f = *frontier_it;
 
@@ -1413,6 +1481,7 @@ void Explore::makePlan()
 
     // 1. Check if centroid is blacklisted
     if (goalOnBlacklist(f.centroid)) {
+      n_blacklist++;
       frontier_it++;
       continue;
     }
@@ -1420,6 +1489,7 @@ void Explore::makePlan()
     // 2. Check if we are already pursuing this frontier
     if (goal_active_ && (same_point(f.centroid, last_sent_goal_position_) ||
                          same_point(f.middle, last_sent_goal_position_))) {
+      n_pursuing++;
       frontier_it++;
       continue;
     }
@@ -1428,6 +1498,7 @@ void Explore::makePlan()
     double dx = f.centroid.x - pose.position.x;
     double dy = f.centroid.y - pose.position.y;
     if (dx * dx + dy * dy < min_goal_distance_for_replanning_ * min_goal_distance_for_replanning_) {
+      n_too_close++;
       frontier_it++;
       continue;
     }
@@ -1438,10 +1509,12 @@ void Explore::makePlan()
     bool safe_viewpoint_found = false;
     best_target = findSafeViewpoint(f.middle, safe_viewpoint_found);
     if (!safe_viewpoint_found) {
+      n_no_viewpoint++;
       frontier_it++;
       continue;
     }
     if (goalOnBlacklist(best_target)) {
+      n_vp_blacklist++;
       frontier_it++;
       continue;
     }
@@ -1500,6 +1573,22 @@ void Explore::makePlan()
     all_gated_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     if (!goal_active_) {
       no_frontier_count_++;
+      // FRONTIER-EXHAUSTION DIAGNOSTIC: names why the explorer is giving up.
+      // frontiers.empty() => genuinely nothing left (full coverage). Otherwise
+      // frontiers EXIST but every one was rejected -- the breakdown says whether
+      // that is blacklisting, unreachable-viewpoint, infeasibility, etc., i.e.
+      // whether the incomplete coverage is a reachability/blacklist artifact
+      // (premature) rather than true completion.
+      RCLCPP_WARN(logger_,
+        "FRONTIER-EXHAUSTION [%d/%d]: %zu frontiers this tick -> "
+        "infeasible=%d blacklisted=%d unreachable_viewpoint=%d vp_blacklisted=%d "
+        "too_close=%d pursuing=%d; total_blacklist=%zu :: %s",
+        no_frontier_count_, no_frontier_retry_, frontiers.size(),
+        n_inf_cost, n_blacklist, n_no_viewpoint, n_vp_blacklist,
+        n_too_close, n_pursuing, frontier_blacklist_.size(),
+        frontiers.empty()
+          ? "genuinely no frontiers left (full coverage)"
+          : "frontiers EXIST but all rejected (PREMATURE: reachability/blacklist-limited)");
       if (no_frontier_count_ >= no_frontier_retry_) {
         no_frontier_count_ = 0;
         // Verification phase disabled: it was looping indefinitely
@@ -1573,6 +1662,8 @@ void Explore::sendGoal(const geometry_msgs::msg::Point & target, bool is_recalib
   last_sent_goal_position_ = target;
   goal_start_pose_ = pose;
   last_progress_ = this->now();
+  last_progress_pos_ = pose.position;
+  has_last_progress_pos_ = true;
   prev_distance_ = std::numeric_limits<double>::infinity();
   no_frontier_count_ = 0;
   last_goal_successful_ = false;
@@ -1776,10 +1867,28 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point & goal)
   constexpr static size_t tolerace = 5;
   nav2_costmap_2d::Costmap2D * costmap2d = costmap_client_.getCostmap();
 
+  // Expire stale entries first (blacklist_ttl_s_ > 0): a frontier ruled out once
+  // -- e.g. its approach transiently blocked, or a single timed-out attempt --
+  // becomes eligible again after the TTL, so the blacklist can't grow without
+  // bound and eventually strand the last residual frontiers (diagnosed
+  // vp_blacklisted premature completion at partial coverage). ttl <= 0 keeps
+  // every entry permanent, reproducing the original behavior. Pruning here, on
+  // the hot path, keeps the list small without a separate timer.
+  if (blacklist_ttl_s_ > 0.0) {
+    const rclcpp::Time now = this->now();
+    frontier_blacklist_.erase(
+      std::remove_if(
+        frontier_blacklist_.begin(), frontier_blacklist_.end(),
+        [&](const std::pair<rclcpp::Time, geometry_msgs::msg::Point> & e) {
+          return (now - e.first).seconds() > blacklist_ttl_s_;
+        }),
+      frontier_blacklist_.end());
+  }
+
   // check if a goal is on the blacklist for goals that we're pursuing
-  for (auto & frontier_goal : frontier_blacklist_) {
-    double x_diff = fabs(goal.x - frontier_goal.x);
-    double y_diff = fabs(goal.y - frontier_goal.y);
+  for (auto & entry : frontier_blacklist_) {
+    double x_diff = fabs(goal.x - entry.second.x);
+    double y_diff = fabs(goal.y - entry.second.y);
 
     if (x_diff < tolerace * costmap2d->getResolution() &&
       y_diff < tolerace * costmap2d->getResolution())
@@ -1912,7 +2021,7 @@ void Explore::resultCallback(
         RCLCPP_WARN(
           logger_, "Navigation goal to (%.2f, %.2f) ABORTED. Adding to blacklist.",
           frontier_goal.x, frontier_goal.y);
-        frontier_blacklist_.push_back(frontier_goal);
+        frontier_blacklist_.push_back({this->now(), frontier_goal});
       }
       last_goal_successful_ = false;
       break;

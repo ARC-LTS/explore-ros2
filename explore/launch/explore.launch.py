@@ -55,6 +55,19 @@ def launch_setup(context, *args, **kwargs):
         # angular coverage. 0.0 (default) disables the cap.
         'radiation_survey_time_cap_s':
             float(LaunchConfiguration('radiation_survey_time_cap_s').perform(context)),
+        # Deny the seek bonus within this radius of a recent stuck-escape
+        # location, so a stall doesn't reinforce attraction toward a goal
+        # behind a physical obstacle the robot has already failed to clear
+        # repeatedly. 0.0 (default) disables this and reproduces prior
+        # behavior.
+        'radiation_seek_trap_avoid_radius_m':
+            float(LaunchConfiguration('radiation_seek_trap_avoid_radius_m').perform(context)),
+        # Seconds after which a blacklisted frontier point becomes eligible
+        # again, preventing an accumulating blacklist from stranding residual
+        # frontiers and completing early with partial coverage. 0.0 (default)
+        # keeps entries permanent, reproducing every trial to date exactly.
+        'blacklist_ttl_s':
+            float(LaunchConfiguration('blacklist_ttl_s').perform(context)),
     })
     # radiation_scale/radiation_gradient_scale/dose_budget_scale are only ever
     # read once, at construction (this->get_parameter(...) into a cached
@@ -147,6 +160,20 @@ def generate_launch_description():
                     'regardless of ray count visited. 0.0 (default) disables '
                     'the cap and reproduces the original behavior exactly.',
     )
+    declare_radiation_seek_trap_avoid_radius_argument = DeclareLaunchArgument(
+        'radiation_seek_trap_avoid_radius_m',
+        default_value='0.0',
+        description='Deny the seek bonus within this radius of a recent '
+                    'stuck-escape location. 0.0 (default) disables trap '
+                    'avoidance and reproduces the original behavior exactly.',
+    )
+    declare_blacklist_ttl_s_argument = DeclareLaunchArgument(
+        'blacklist_ttl_s',
+        default_value='0.0',
+        description='Seconds after which a blacklisted frontier becomes '
+                    'eligible again. 0.0 (default) keeps entries permanent and '
+                    'reproduces every trial to date exactly.',
+    )
 
     ld.add_action(declare_use_sim_time_argument)
     ld.add_action(declare_namespace_argument)
@@ -157,5 +184,7 @@ def generate_launch_description():
     ld.add_action(declare_radiation_seek_adaptive_argument)
     ld.add_action(declare_radiation_survey_dirs_argument)
     ld.add_action(declare_radiation_survey_time_cap_argument)
+    ld.add_action(declare_radiation_seek_trap_avoid_radius_argument)
+    ld.add_action(declare_blacklist_ttl_s_argument)
     ld.add_action(OpaqueFunction(function=launch_setup))
     return ld

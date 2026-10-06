@@ -52,7 +52,9 @@ FrontierSearch::searchFrom(
   double dose_budget_scale,
   double frontier_spend_fraction,
   const cv::Mat & heatmap_std,
-  double radiation_seek_scale)
+  double radiation_seek_scale,
+  const std::vector<geometry_msgs::msg::Point> & recent_trap_locations,
+  double trap_avoid_radius_m)
 {
   std::vector<Frontier> frontier_list;
 
@@ -164,7 +166,8 @@ FrontierSearch::searchFrom(
       heatmap, radiation_scale, radiation_gradient_scale,
       lethal_point_ceiling_mrem_hr, explored_grid, current_goal,
       remaining_dose_budget, dose_budget_scale, frontier_spend_fraction,
-      heatmap_std, radiation_seek_scale);
+      heatmap_std, radiation_seek_scale,
+      recent_trap_locations, trap_avoid_radius_m);
   }
 
   // --- Frontier Clustering ("Mean Frontier Candidate") ---
@@ -221,7 +224,8 @@ FrontierSearch::searchFrom(
           heatmap, radiation_scale, radiation_gradient_scale,
           lethal_point_ceiling_mrem_hr, explored_grid, current_goal,
           remaining_dose_budget, dose_budget_scale, frontier_spend_fraction,
-          heatmap_std, radiation_seek_scale);
+          heatmap_std, radiation_seek_scale,
+          recent_trap_locations, trap_avoid_radius_m);
     }
     frontier_list = clustered_list;
   }
@@ -407,7 +411,9 @@ double FrontierSearch::frontierCost(
   double dose_budget_scale,
   double frontier_spend_fraction,
   const cv::Mat & heatmap_std,
-  double radiation_seek_scale)
+  double radiation_seek_scale,
+  const std::vector<geometry_msgs::msg::Point> & recent_trap_locations,
+  double trap_avoid_radius_m)
 {
   frontier.info_gain = 0.0;
   // Battery feasibility check.
@@ -627,6 +633,27 @@ double FrontierSearch::frontierCost(
           // interest.
           double max_seek_benefit = potential_scale_ * frontier.min_distance * 0.25;
           seek_bonus = std::max(seek_bonus, -max_seek_benefit);
+
+          // Deny the bonus entirely near a recent stuck-escape location.
+          // Observed directly (c06_r04_adapt10v3, 2026-07-21): amplifying
+          // attraction toward an elevated-but-uncertain frontier while the
+          // robot is stalled can reinforce a goal on the far side of a
+          // physical obstacle it has already failed to get past repeatedly,
+          // rather than letting the stuck-escape/blacklist machinery route
+          // around it -- the feedback loop that wedged the robot for the
+          // back half of that mission (31 stuck-escape events over ~800s,
+          // then fully immobile for the rest of it). trap_avoid_radius_m
+          // == 0.0 (default) disables this and reproduces prior behavior.
+          if (trap_avoid_radius_m > 0.0) {
+            for (const auto & trap : recent_trap_locations) {
+              double tdx = frontier.centroid.x - trap.x;
+              double tdy = frontier.centroid.y - trap.y;
+              if (tdx * tdx + tdy * tdy < trap_avoid_radius_m * trap_avoid_radius_m) {
+                seek_bonus = 0.0;
+                break;
+              }
+            }
+          }
         }
       }
     }
