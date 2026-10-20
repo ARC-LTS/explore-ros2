@@ -207,12 +207,12 @@ The current mode is published, latched, on **`~/mode`** as `std_msgs/String`
   or crossing the battery thresholds forces a return to the initial pose (with retry/
   cancel budgets for stuck-escape preemptions).
 
-> **Dead code to note:** the verification phase (`startVerification`,
-> `max_verification_attempts`) is **disabled** — `makePlan()` calls
-> `handleExplorationCompletion(true)` directly once frontiers are exhausted (it was
-> looping indefinitely). The `max_verification_attempts` parameter is therefore inert on
-> the live path. `critical_dose_mrem_hr` is likewise retained for semantics but **no
-> longer hard-gates** frontier targeting.
+> **Removed dead code:** the old verification phase (`startVerification`,
+> `max_verification_attempts`) was unreachable — `makePlan()` calls
+> `handleExplorationCompletion(true)` directly once frontiers are exhausted (the
+> verification loop had been observed looping indefinitely) — and has been removed on the
+> `maintenance` branch. `critical_dose_mrem_hr`, which no longer gated frontier targeting,
+> was removed with it. Behavior is unchanged; overrides of either parameter are ignored.
 
 ### Cross-layer dose-budget contract (§4)
 
@@ -321,7 +321,6 @@ flagged). The YAML is the configuration actually shipped to the robot.
 | `radiation_survey_dirs` | 8 | — | Boundary-survey ray count |
 | `radiation_survey_time_cap_s` | 0.0 | — | Boundary-survey wall-clock cap (0 = off) |
 | `max_radiation_dose` | 100.0 | 100.0 | Cumulative dose budget (mR) → return home |
-| `critical_dose_mrem_hr` | 2.0 | 2.0 | **Retained but no longer gates targeting** |
 | `acute_dose_rate_mrem_hr` | 10.0 | 10.0 | Acute rate → stop + yield to recovery (1e6 in Baseline) |
 | `dose_budget_scale` | 10.0 | 10.0 | Transit-dose efficiency weight (zeroed in Baseline arm) |
 | `safe_dose_threshold_mrem_hr` | 0.5 | 1.0 | "Elevated" threshold for survey crossings |
@@ -349,9 +348,9 @@ flagged). The YAML is the configuration actually shipped to the robot.
 
 `explore/launch/explore.launch.py` loads `config/params.yaml` and exposes launch
 arguments that are injected **at launch time** (important: `radiation_scale`,
-`radiation_gradient_scale`, and `dose_budget_scale` are read once at construction with
-**no** `on_set_parameters` callback — a runtime `ros2 param set` has no behavioural
-effect):
+`radiation_gradient_scale`, and `dose_budget_scale` are read once at construction and
+are declared **read-only**, so a runtime `ros2 param set` on them is rejected; set them
+at launch):
 
 | Launch arg | Default | Effect |
 |---|---|---|
