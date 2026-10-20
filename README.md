@@ -210,8 +210,8 @@ The current mode is published, latched, on **`~/mode`** as `std_msgs/String`
 > **Removed dead code:** the old verification phase (`startVerification`,
 > `max_verification_attempts`) was unreachable — `makePlan()` calls
 > `handleExplorationCompletion(true)` directly once frontiers are exhausted (the
-> verification loop had been observed looping indefinitely) — and has been removed on the
-> `maintenance` branch. `critical_dose_mrem_hr`, which no longer gated frontier targeting,
+> verification loop had been observed looping indefinitely) — and has been removed since the
+> `dissertation-2026` tag. `critical_dose_mrem_hr`, which no longer gated frontier targeting,
 > was removed with it. Behavior is unchanged; overrides of either parameter are ignored.
 
 ### Cross-layer dose-budget contract (§4)
