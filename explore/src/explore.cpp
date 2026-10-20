@@ -43,6 +43,7 @@
 #include <numeric>
 #include <thread>
 #include "nav2_costmap_2d/cost_values.hpp"
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <tf2/utils.h>
 
 inline static bool same_point(
@@ -115,10 +116,18 @@ Explore::Explore()
   this->declare_parameter<std::string>("heatmap_std_topic", "/rad_heatmap/gp_std_dev");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
   this->declare_parameter<double>("acute_dose_rate_mrem_hr", 10.0);
-  this->declare_parameter<double>("dose_budget_scale", 10.0);
+  // The radiation cost weights are read once below and cached; there is no
+  // parameter callback. Declaring them read-only makes a runtime
+  // `ros2 param set` fail loudly instead of silently having no effect. They
+  // can still be set at launch (this is how the Baseline arm zeroes them).
+  rcl_interfaces::msg::ParameterDescriptor launch_time_only;
+  launch_time_only.read_only = true;
+  launch_time_only.description =
+    "Read once at construction; set at launch time (runtime changes are rejected).";
+  this->declare_parameter<double>("dose_budget_scale", 10.0, launch_time_only);
   this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.5);
-  this->declare_parameter<double>("radiation_scale", 1.0);
-  this->declare_parameter<double>("radiation_gradient_scale", 1.0);
+  this->declare_parameter<double>("radiation_scale", 1.0, launch_time_only);
+  this->declare_parameter<double>("radiation_gradient_scale", 1.0, launch_time_only);
   // Information-gain-style attraction term, capped and safety-gate-blind
   // (see frontierCost's seek_bonus): 0.0 reproduces the prior
   // avoidance-only behavior exactly.

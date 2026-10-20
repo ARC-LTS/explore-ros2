@@ -69,13 +69,10 @@ def launch_setup(context, *args, **kwargs):
         'blacklist_ttl_s':
             float(LaunchConfiguration('blacklist_ttl_s').perform(context)),
     })
-    # radiation_scale/radiation_gradient_scale/dose_budget_scale are only ever
-    # read once, at construction (this->get_parameter(...) into a cached
-    # member) -- there is no on_set_parameters callback, so a runtime
-    # `ros2 param set` on a running node has zero effect on behavior even
-    # though it updates the parameter server's stored value. This must be
-    # set here, at launch time, to actually realize a radiation-agnostic
-    # baseline arm.
+    # radiation_scale/radiation_gradient_scale/dose_budget_scale are read once,
+    # at construction, and are declared read-only, so a runtime
+    # `ros2 param set` on a running node is rejected. They must be set here,
+    # at launch time, to realize the radiation-agnostic baseline arm.
     if LaunchConfiguration('radiation_agnostic').perform(context) == 'true':
         parameters.append({
             'radiation_scale': 0.0,
