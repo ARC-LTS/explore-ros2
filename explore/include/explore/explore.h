@@ -278,8 +278,6 @@ private:
     double all_gated_completion_timeout_s_ = 180.0;
     rclcpp::Time all_gated_since_{0, 0, RCL_ROS_TIME};
     int frontiers_explored_count_ = 0;
-    bool is_verifying_ = false;
-    int verification_attempts_ = 0;
     void returnToInitialPose(void);
 
     // Retry state for returnToInitialPose(): a cancellation (e.g. from
@@ -382,7 +380,6 @@ private:
     bool radiation_seek_adaptive_;     // scale seek_bonus by a stall deficit instead of a constant
     int radiation_survey_dirs_;        // boundary-survey ray count (default 8)
     double radiation_survey_time_cap_s_;  // boundary-survey time budget (0.0 = disabled)
-    double critical_dose_mrem_hr_;     // cost-function penalty threshold
     double acute_dose_rate_mrem_hr_;   // hard stop: triggers evacuation + blacklist
     double dose_budget_scale_;
     double safe_dose_threshold_mrem_hr_;
@@ -455,11 +452,7 @@ private:
     int explored_count_ = 0;
     void updateExploredArea();
 
-    // verification parameters
-    int max_verification_attempts_;
-
     void handleExplorationCompletion(bool force_return = false);
-    void startVerification();
     // Searches a small radius around `center` for a low-cost, non-inscribed-
     // obstacle cell to use as a goal -- used both to back a frontier goal off
     // a wall/shelf, and (centered on the robot's own pose) to find nearby

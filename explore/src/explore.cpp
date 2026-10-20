@@ -114,7 +114,6 @@ Explore::Explore()
   this->declare_parameter<std::string>("heatmap_topic", "/rad_heatmap/raw_mean_map");
   this->declare_parameter<std::string>("heatmap_std_topic", "/rad_heatmap/gp_std_dev");
   this->declare_parameter<double>("max_radiation_dose", 100.0);
-  this->declare_parameter<double>("critical_dose_mrem_hr", 2.0);
   this->declare_parameter<double>("acute_dose_rate_mrem_hr", 10.0);
   this->declare_parameter<double>("dose_budget_scale", 10.0);
   this->declare_parameter<double>("safe_dose_threshold_mrem_hr", 0.5);
@@ -152,7 +151,6 @@ Explore::Explore()
   // visited, rather than reducing angular coverage. 0.0 (default) disables
   // the cap and reproduces the original behavior exactly.
   this->declare_parameter<double>("radiation_survey_time_cap_s", 0.0);
-  this->declare_parameter<int>("max_verification_attempts", 3);
   this->declare_parameter<double>("max_battery_used", 0.9);
   this->declare_parameter<int>("radiation_mode_hysteresis", 5);
   this->declare_parameter<int>("radiation_mode_entry_hysteresis", 5);
@@ -189,7 +187,6 @@ Explore::Explore()
   this->get_parameter("heatmap_topic", heatmap_topic_);
   this->get_parameter("heatmap_std_topic", heatmap_std_topic_);
   this->get_parameter("max_radiation_dose", max_radiation_dose_);
-  this->get_parameter("critical_dose_mrem_hr", critical_dose_mrem_hr_);
   this->get_parameter("acute_dose_rate_mrem_hr", acute_dose_rate_mrem_hr_);
   this->get_parameter("dose_budget_scale", dose_budget_scale_);
   this->get_parameter("safe_dose_threshold_mrem_hr", safe_dose_threshold_mrem_hr_);
@@ -203,7 +200,6 @@ Explore::Explore()
   this->get_parameter("radiation_seek_trap_window_s", radiation_seek_trap_window_s_);
   this->get_parameter("radiation_survey_dirs", radiation_survey_dirs_);
   this->get_parameter("radiation_survey_time_cap_s", radiation_survey_time_cap_s_);
-  this->get_parameter("max_verification_attempts", max_verification_attempts_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
   this->get_parameter("max_battery_used", max_battery_used_);
   this->get_parameter("radiation_mode_hysteresis", radiation_mode_hysteresis_);
@@ -312,7 +308,7 @@ Explore::Explore()
 
   // Captured unconditionally (not gated on return_to_init_): handleExploration
   // Completion() unconditionally targets initial_pose_ on any forced
-  // completion (battery/dose exhausted, verification exhausted) regardless
+  // completion (battery/dose exhausted, frontiers exhausted) regardless
   // of return_to_init_'s value. With the old return_to_init_ gate here,
   // initial_pose_ was left at its default-constructed (0,0,0, all-zero/
   // invalid quaternion) value whenever return_to_init_ was false -- its
@@ -1371,7 +1367,7 @@ void Explore::makePlan()
 
   double remaining_dose_budget = std::max(0.0, max_radiation_dose_ - cumulative_dose_);
   // The point-lethality ceiling tracks the effective acute yield threshold
-  // (not the old fixed critical_dose_mrem_hr_ of 2.0): only destinations
+  // (not the old fixed critical_dose_mrem_hr of 2.0, since removed): only destinations
   // that would immediately re-trigger the acute cascade on arrival are
   // hard-rejected; affordability of merely-elevated destinations is
   // decided by the transit-dose gate inside frontierCost.
@@ -1700,93 +1696,6 @@ void Explore::handleExplorationCompletion(bool force_return)
   }
 }
 
-void Explore::startVerification()
-{
-  if (verification_attempts_ >= max_verification_attempts_) {
-    RCLCPP_WARN(
-      logger_,
-      "Verification phase complete after %d attempts. No new frontiers found. Believing completion.",
-      verification_attempts_);
-    handleExplorationCompletion(true);
-    return;
-  }
-
-  is_verifying_ = true;
-  verification_attempts_++;
-
-  RCLCPP_INFO(
-    logger_,
-    "Starting verification attempt %d/%d to ensure no regions were missed. Explored %d frontiers so far.",
-    verification_attempts_, max_verification_attempts_, frontiers_explored_count_);
-
-  geometry_msgs::msg::PoseStamped pose_stamped;
-  if (!costmap_client_.getRobotPose(pose_stamped)) {
-    return;
-  }
-  auto pose = pose_stamped.pose;
-  geometry_msgs::msg::Point verification_goal;
-  bool found_goal = false;
-
-  // Systematically check different directions (N, S, E, W, NE, NW, SE, SW)
-  double angles[] =
-  {0.0, M_PI, M_PI / 2.0, -M_PI / 2.0, M_PI / 4.0, 3.0 * M_PI / 4.0, -M_PI / 4.0,
-    -3.0 * M_PI / 4.0};
-  int start_angle_idx = (verification_attempts_ - 1) % 8;
-  double search_distance = 4.0 + 4.0 * ((verification_attempts_ - 1) / 2); // Increase distance every 2 attempts
-
-  for (int i = 0; i < 8; ++i) {
-    int idx = (start_angle_idx + i) % 8;
-    double angle = angles[idx];
-    verification_goal.x = pose.position.x + search_distance * cos(angle);
-    verification_goal.y = pose.position.y + search_distance * sin(angle);
-
-    unsigned int mx, my;
-    if (costmap_client_.getCostmap()->worldToMap(
-        verification_goal.x, verification_goal.y, mx,
-        my))
-    {
-      unsigned char cost = costmap_client_.getCostmap()->getCost(mx, my);
-      if (cost < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-        found_goal = true;
-        break;
-      }
-    }
-  }
-
-  if (found_goal) {
-    RCLCPP_INFO(
-      logger_, "Verification: Traversing to region at (%.2f, %.2f) to check for missing frontiers.",
-      verification_goal.x, verification_goal.y);
-    auto goal = nav2_msgs::action::NavigateToPose::Goal();
-    goal.pose.pose.position = verification_goal;
-    goal.pose.pose.orientation = pose.orientation;
-    goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-    goal.pose.header.stamp = this->now();
-
-    auto send_goal_options =
-      rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-    send_goal_options.result_callback = std::bind(
-      &Explore::resultCallback, this, _1,
-      verification_goal);
-    send_goal_options.goal_response_callback = std::bind(&Explore::goalResponseCallback, this, _1);
-    send_goal_options.feedback_callback = std::bind(&Explore::feedbackCallback, this, _1, _2);
-
-    waiting_for_goal_response_ = true;
-    move_base_client_->async_send_goal(goal, send_goal_options);
-
-    last_sent_goal_position_ = verification_goal;
-    goal_start_pose_ = pose;
-    last_progress_ = this->now();
-    prev_distance_ = std::numeric_limits<double>::infinity();
-  } else {
-    RCLCPP_WARN(
-      logger_,
-      "Verification: Could not find a valid goal in attempt %d. Trying next attempt.",
-      verification_attempts_);
-    startVerification(); // Recursive call to next attempt
-  }
-}
-
 void Explore::returnToInitialPose()
 {
   RCLCPP_INFO(logger_, "Returning to initial pose.");
@@ -2007,9 +1916,7 @@ void Explore::resultCallback(
         logger_, "Navigation goal to (%.2f, %.2f) SUCCEEDED.", frontier_goal.x,
         frontier_goal.y);
       last_goal_successful_ = true;
-      if (!is_verifying_) {
-        frontiers_explored_count_++;
-      }
+      frontiers_explored_count_++;
       break;
     case rclcpp_action::ResultCode::ABORTED:
       if (waiting_for_goal_response_) {
@@ -2109,8 +2016,6 @@ bool Explore::resetServiceCallback(
   no_frontier_count_      = 0;
   frontiers_explored_count_ = 0;
   is_recovering_          = false;
-  is_verifying_           = false;
-  verification_attempts_  = 0;
   exploration_finished_   = false;
   has_last_trajectory_    = false;
   has_queued_target_      = false;

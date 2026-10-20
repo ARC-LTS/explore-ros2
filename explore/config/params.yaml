@@ -23,11 +23,10 @@
     battery_penalty_scale: 1.0
     max_battery_used: 0.8
     max_radiation_dose: 100.0
-    # critical_dose_mrem_hr no longer hard-gates frontier targeting (kept for
-    # the safe-zone/cost semantics elsewhere); the frontier point-lethality
-    # ceiling now tracks the effective acute threshold, and affordability is
-    # decided by the transit-dose gate (frontier_dose_spend_fraction).
-    critical_dose_mrem_hr: 2.0
+    # There is no critical_dose_mrem_hr here: it no longer gated anything and
+    # has been removed. The frontier point-lethality ceiling tracks the
+    # effective acute threshold, and affordability is decided by the
+    # transit-dose gate (frontier_dose_spend_fraction).
     acute_dose_rate_mrem_hr: 10.0
     dose_budget_scale: 10.0
     # Max fraction of the remaining dose budget one frontier visit (round
@@ -43,5 +42,4 @@
     heatmap_topic: /rad_heatmap/raw_mean_map
     radiation_scale: 1.0
     radiation_gradient_scale: 1.0
-    max_verification_attempts: 5
     min_goal_distance_for_replanning: 0.75
