@@ -44,6 +44,7 @@ find_package(nav2_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(map_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(ros2_rad_map REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -64,6 +65,7 @@ set(DEPENDENCIES
   map_msgs
   nav2_costmap_2d
   visualization_msgs
+  ros2_rad_map
   cv_bridge
   OpenCV
 )

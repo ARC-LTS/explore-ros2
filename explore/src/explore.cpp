@@ -307,6 +307,10 @@ Explore::Explore()
     "/rad_heatmap/stable_source_captured", 10,
     std::bind(&Explore::stableSourceCallback, this, std::placeholders::_1));
 
+  rad_zones_sub_ = this->create_subscription<ros2_rad_map::msg::RadZoneArray>(
+    "/radiation_zones", 10,
+    std::bind(&Explore::radZonesCallback, this, std::placeholders::_1));
+
   stuck_escape_event_sub_ = this->create_subscription<std_msgs::msg::Float64>(
     "/stuck_escape/event", 10,
     std::bind(&Explore::stuckEscapeEventCallback, this, std::placeholders::_1));
@@ -543,7 +547,10 @@ void Explore::radiationCallback(const std_msgs::msg::Float64MultiArray::SharedPt
   }
 
   // --- Exit: rolling-mean drops below threshold (only when active) ---
-  if (!stopped_ &&
+  // (Not while driving to a peak-finder zone: readings are low en route by
+  // definition, and the arrival check in generateRadiationFrontiers owns that
+  // episode's exit.)
+  if (!stopped_ && !zone_target_active_ && !zone_ring_active_ &&
       exploration_mode_ == ExplorationMode::RADIATION &&
       recent_rad_buffer_.size() == static_cast<size_t>(radiation_mode_hysteresis_) &&
       recent_mean < dynamic_threshold)
@@ -680,9 +687,54 @@ void Explore::heatmapStdCallback(const sensor_msgs::msg::Image::SharedPtr msg)
   }
 }
 
+void Explore::radZonesCallback(const ros2_rad_map::msg::RadZoneArray::SharedPtr msg)
+{
+  // Engage RADIATION mode the moment the peak finder reports a candidate
+  // source the robot has not localized yet, and drive to its estimated
+  // position. The reading-based entry (dynamic threshold, radCallback) only
+  // fires when the robot happens to pass through the plume; with weak
+  // (2-3 mrem/hr) sources it drove past the zone in spatial mode and went
+  // home without ever characterizing it (2026-10-29).
+  if (stopped_ || exploration_finished_ || zone_target_active_ || zone_ring_active_) return;
+  const ros2_rad_map::msg::RadZone * best = nullptr;
+  for (const auto & z : msg->zones) {
+    bool known = false;
+    for (const auto & l : localized_zones_) {
+      double dx = z.center.x - l.x, dy = z.center.y - l.y;
+      if (dx * dx + dy * dy < zone_revisit_radius_m_ * zone_revisit_radius_m_) { known = true; break; }
+    }
+    if (known) continue;
+    if (!best || z.center.z > best->center.z) best = &z;
+  }
+  if (!best) return;
+
+  zone_target_ = best->center;
+  zone_target_active_ = true;
+  radiation_in_boundary_phase_ = false;
+  radiation_mode_above_count_ = 0;
+  recent_rad_buffer_.clear();
+  if (exploration_mode_ != ExplorationMode::RADIATION) {
+    exploration_mode_ = ExplorationMode::RADIATION;
+    std_msgs::msg::String mode_msg;
+    mode_msg.data = "radiation_mode";
+    mode_publisher_->publish(mode_msg);
+  }
+  RCLCPP_INFO(logger_,
+    "Source candidate %s at (%.2f, %.2f) ~%.2f mrem/hr: RADIATION mode, driving to localize it.",
+    best->label.c_str(), best->center.x, best->center.y, best->center.z);
+  // Drop the current spatial goal so the next plan goes to the zone now.
+  if (goal_active_) {
+    move_base_client_->async_cancel_goal(navigation_goal_handle_);
+  }
+}
+
 void Explore::stableSourceCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
 {
   if (exploration_mode_ != ExplorationMode::RADIATION) return;
+  // A zone episode owns its own exit (ring sweep complete); the heatmap node
+  // commits a "stable" cluster within seconds of the first elevated reading,
+  // which ended episodes early and marked the spot localized (2026-10-29).
+  if (zone_target_active_ || zone_ring_active_) return;
 
   // A stable, averaged measurement has been committed by the heatmap node.
   // That means we've adequately characterised this source — switch back to
@@ -691,6 +743,11 @@ void Explore::stableSourceCallback(const geometry_msgs::msg::PointStamped::Share
   radiation_in_boundary_phase_ = false;
   radiation_mode_above_count_ = 0;  // prevent immediately re-entering RADIATION mode
   recent_rad_buffer_.clear();       // flush the rolling window so exit isn't re-triggered
+  zone_target_active_ = false;
+  zone_ring_active_ = false;
+  zone_wp_latched_ = false;
+  zone_ring_.clear();
+  localized_zones_.push_back(msg->point);
 
   std_msgs::msg::String mode_msg;
   mode_msg.data = "spatial_exploration";
@@ -939,8 +996,184 @@ void Explore::visualizeFrontiers(
 //
 // When the gradient is negligible the robot is already near the peak — no
 // frontiers are generated and commitPendingSample() will fire naturally.
+std::vector<frontier_exploration::Frontier> Explore::generateCoverageSweepFrontiers(
+  const geometry_msgs::msg::Point & robot)
+{
+  nav2_costmap_2d::Costmap2D * cm = costmap_client_.getCostmap();
+  if (!cm) return {};
+  const double res = cm->getResolution();
+  const int step = std::max(1, static_cast<int>(rad_sweep_spacing_m_ / res));
+  const double r2 = rad_sweep_radius_m_ * rad_sweep_radius_m_;
+  auto sampled = [&](double x, double y) {
+    for (const auto & t : rad_trail_) {
+      double dx = x - t.x, dy = y - t.y;
+      if (dx * dx + dy * dy <= r2) return true;
+    }
+    return false;
+  };
+  std::vector<geometry_msgs::msg::Point> cands;
+  for (unsigned int my = step / 2; my < cm->getSizeInCellsY(); my += step) {
+    for (unsigned int mx = step / 2; mx < cm->getSizeInCellsX(); mx += step) {
+      if (cm->getCost(mx, my) >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) continue;  // also skips unknown (255)
+      geometry_msgs::msg::Point p;
+      cm->mapToWorld(mx, my, p.x, p.y);
+      if (sampled(p.x, p.y)) continue;
+      bool ok = false;
+      geometry_msgs::msg::Point vp = findSafeViewpoint(p, ok);
+      if (!ok) continue;
+      if (goalOnBlacklist(vp)) continue;
+      cands.push_back(vp);
+    }
+  }
+  if (cands.empty()) {
+    if (sweep_announced_) {
+      RCLCPP_INFO(logger_, "Radiation coverage sweep complete.");
+      sweep_announced_ = false;
+    }
+    sweep_wp_latched_ = false;
+    return {};
+  }
+  sweep_announced_ = true;
+  bool still_pending = sweep_wp_latched_ && std::any_of(cands.begin(), cands.end(),
+    [&](const geometry_msgs::msg::Point & p) {
+      return std::hypot(p.x - sweep_wp_.x, p.y - sweep_wp_.y) < 0.5;
+    });
+  if (!still_pending) {
+    auto nearest = std::min_element(cands.begin(), cands.end(),
+      [&](const geometry_msgs::msg::Point & a, const geometry_msgs::msg::Point & b) {
+        return std::hypot(a.x - robot.x, a.y - robot.y) < std::hypot(b.x - robot.x, b.y - robot.y);
+      });
+    sweep_wp_ = *nearest;
+    sweep_wp_latched_ = true;
+    RCLCPP_INFO(logger_, "Sweep: %zu point(s) left, heading to (%.2f, %.2f).",
+      cands.size(), sweep_wp_.x, sweep_wp_.y);
+  }
+  frontier_exploration::Frontier f;
+  f.centroid = f.middle = f.initial = sweep_wp_;
+  f.size = 1;
+  f.min_distance = std::hypot(sweep_wp_.x - robot.x, sweep_wp_.y - robot.y);
+  f.cost = f.min_distance;
+  f.info_gain = 1.0;
+  f.is_radiation = false;
+  f.fixed_goal = true;
+  f.points.push_back(sweep_wp_);
+  return {f};
+}
+
+void Explore::finishZoneEpisode(const char * why)
+{
+  zone_target_active_ = false;
+  zone_ring_active_ = false;
+  zone_wp_latched_ = false;
+  zone_ring_.clear();
+  localized_zones_.push_back(zone_ring_center_);
+  exploration_mode_ = ExplorationMode::SPATIAL;
+  radiation_in_boundary_phase_ = false;
+  radiation_mode_above_count_ = 0;
+  recent_rad_buffer_.clear();
+  std_msgs::msg::String mode_msg;
+  mode_msg.data = "spatial_exploration";
+  mode_publisher_->publish(mode_msg);
+  RCLCPP_INFO(logger_, "Zone at (%.2f, %.2f) localized (%s). Returning to SPATIAL mode.",
+    zone_ring_center_.x, zone_ring_center_.y, why);
+}
+
 std::vector<frontier_exploration::Frontier> Explore::generateRadiationFrontiers()
 {
+  // Phase 0 -- peak-finder zone episode (radZonesCallback): drive to the
+  // estimate, then sweep a ring of waypoints around it so the GP gets samples
+  // on every side of the source, then release.
+  if (zone_target_active_ || zone_ring_active_) {
+    geometry_msgs::msg::PoseStamped zp;
+    if (!costmap_client_.getRobotPose(zp)) return {};
+    const auto & rp = zp.pose.position;
+    nav2_costmap_2d::Costmap2D * cm = costmap_client_.getCostmap();
+    auto free_cell = [&](const geometry_msgs::msg::Point & p) {
+      unsigned int mx, my;
+      return cm && cm->worldToMap(p.x, p.y, mx, my) &&
+             cm->getCost(mx, my) < nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE;
+    };
+    auto make_frontier = [&](const geometry_msgs::msg::Point & p) {
+      frontier_exploration::Frontier f;
+      f.centroid = f.middle = f.initial = p;
+      f.size = 1;
+      f.info_gain = zone_target_.z;
+      f.min_distance = std::hypot(p.x - rp.x, p.y - rp.y);
+      f.is_radiation = true;
+      f.fixed_goal = true;
+      f.points.push_back(p);
+      f.cost = f.min_distance;
+      return f;
+    };
+
+    if (zone_target_active_) {
+      double d = std::hypot(zone_target_.x - rp.x, zone_target_.y - rp.y);
+      if (d > zone_arrival_radius_m_) {
+        if (!zone_wp_latched_) {
+          bool vp_ok = false;
+          geometry_msgs::msg::Point vp = findSafeViewpoint(zone_target_, vp_ok);
+          zone_wp_ = vp_ok ? vp : zone_target_;
+          zone_wp_latched_ = true;
+        }
+        if (goalOnBlacklist(zone_wp_)) {
+          zone_ring_center_ = zone_target_;
+          finishZoneEpisode("estimate blacklisted, giving up");
+          return {};
+        }
+        return {make_frontier(zone_wp_)};
+      }
+      // Arrived: lay out the ring.
+      zone_target_active_ = false;
+      zone_wp_latched_ = false;
+      zone_ring_center_ = zone_target_;
+      zone_ring_.clear();
+      for (int k = 0; k < zone_ring_points_; ++k) {
+        double a = k * (2.0 * M_PI / zone_ring_points_);
+        geometry_msgs::msg::Point p;
+        p.x = zone_ring_center_.x + zone_ring_radius_m_ * std::cos(a);
+        p.y = zone_ring_center_.y + zone_ring_radius_m_ * std::sin(a);
+        if (!free_cell(p)) {
+          bool ok = false;
+          geometry_msgs::msg::Point q = findSafeViewpoint(p, ok);
+          if (!ok) continue;
+          p = q;
+        }
+        if (goalOnBlacklist(p)) continue;
+        zone_ring_.push_back(p);
+      }
+      zone_ring_active_ = !zone_ring_.empty();
+      RCLCPP_INFO(logger_,
+        "Reached source estimate (%.2f, %.2f). Sweeping %zu ring points at %.1f m.",
+        zone_ring_center_.x, zone_ring_center_.y, zone_ring_.size(), zone_ring_radius_m_);
+      if (!zone_ring_active_) { finishZoneEpisode("no reachable ring points"); return {}; }
+    }
+
+    if (zone_ring_active_) {
+      // Drop points already visited (or blacklisted by a failed goal).
+      zone_ring_.erase(std::remove_if(zone_ring_.begin(), zone_ring_.end(),
+        [&](const geometry_msgs::msg::Point & p) {
+          return std::hypot(p.x - rp.x, p.y - rp.y) <= zone_ring_visit_m_ || goalOnBlacklist(p);
+        }), zone_ring_.end());
+      if (zone_ring_.empty()) { finishZoneEpisode("ring sweep complete"); return {}; }
+      // Keep the latched point while it is still pending; otherwise take the
+      // nearest remaining one and latch it.
+      bool still_pending = zone_wp_latched_ && std::any_of(zone_ring_.begin(), zone_ring_.end(),
+        [&](const geometry_msgs::msg::Point & p) {
+          return std::hypot(p.x - zone_wp_.x, p.y - zone_wp_.y) < 1e-3;
+        });
+      if (!still_pending) {
+        auto nearest = std::min_element(zone_ring_.begin(), zone_ring_.end(),
+          [&](const geometry_msgs::msg::Point & a, const geometry_msgs::msg::Point & b) {
+            return std::hypot(a.x - rp.x, a.y - rp.y) < std::hypot(b.x - rp.x, b.y - rp.y);
+          });
+        zone_wp_ = *nearest;
+        zone_wp_latched_ = true;
+        RCLCPP_INFO(logger_, "Ring point %zu left: heading to (%.2f, %.2f).",
+          zone_ring_.size(), zone_wp_.x, zone_wp_.y);
+      }
+      return {make_frontier(zone_wp_)};
+    }
+  }
   if (latest_heatmap_.empty()) return {};
 
   nav2_costmap_2d::Costmap2D * costmap = costmap_client_.getCostmap();
@@ -1192,6 +1425,13 @@ void Explore::makePlan()
   }
   auto pose = pose_stamped.pose;
 
+  if (rad_trail_.empty() ||
+      std::hypot(pose.position.x - rad_trail_.back().x,
+                 pose.position.y - rad_trail_.back().y) >= 0.5)
+  {
+    rad_trail_.push_back(pose.position);
+  }
+
   // Rolling position history for effectiveRadiationSeekScale()'s stall
   // deficit: tracked directly from the robot's own pose every tick,
   // independent of last_progress_/goal bookkeeping (see explore.h for why).
@@ -1253,10 +1493,7 @@ void Explore::makePlan()
     RCLCPP_WARN(
       logger_,
       "Nav2 recovered while navigating. Retreating to nearby safe space before resuming exploration.");
-    if (goal_active_) {
-      move_base_client_->async_cancel_goal(navigation_goal_handle_);
-      goal_active_ = false;
-    }
+    goal_active_ = false;  // the retreat goal below preempts the current one
     bool safe_found = false;
     geometry_msgs::msg::Point safe_point = findSafeViewpoint(pose.position, safe_found);
     if (safe_found) {
@@ -1363,7 +1600,11 @@ void Explore::makePlan()
     }
 
     if (is_current_goal_invalid) {
-      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      // Do not cancel here: the replacement goal sent below preempts it, and
+      // a cancel landing after that send aborted the *new* goal (Nav2 aborts
+      // its current handle), which then got blacklisted (2026-10-29).
+      // Cancelled only if no replacement is found this tick.
+      invalid_goal_pending_cancel_ = true;
       goal_active_ = false;
       // We fall through to allow the search to immediately find a replacement.
     }
@@ -1403,7 +1644,11 @@ void Explore::makePlan()
   // 1. Generate radiation frontiers (ascent phase or boundary survey phase).
   // 2. If the boundary survey is complete (no more frontiers), exit RADIATION mode.
   // 3. Re-sort remaining frontiers so spatial fallbacks are radiation-aware.
-  if (exploration_mode_ == ExplorationMode::RADIATION && !latest_heatmap_.empty()) {
+  // (zone_target_active_: a peak-finder zone can be pursued before the first
+  // heatmap frame arrives; generateRadiationFrontiers handles that branch
+  // without the heatmap.)
+  if (exploration_mode_ == ExplorationMode::RADIATION &&
+      (!latest_heatmap_.empty() || zone_target_active_ || zone_ring_active_)) {
     auto rad_frontiers = generateRadiationFrontiers();
 
     if (rad_frontiers.empty() && radiation_in_boundary_phase_) {
@@ -1446,6 +1691,15 @@ void Explore::makePlan()
 
   if (visualize_) {
     visualizeFrontiers(frontiers);
+  }
+
+  // Radiation coverage sweep: appended last, so it is only chosen once every
+  // spatial frontier is gone or skipped (blacklisted / no viewpoint). Previously
+  // it ran only on an empty list, so "2 frontiers, both blacklisted" still
+  // ended the mission before the sweep (2026-10-29).
+  if (!zone_target_active_ && !zone_ring_active_) {
+    auto sweep = generateCoverageSweepFrontiers(pose.position);
+    frontiers.insert(frontiers.end(), sweep.begin(), sweep.end());
   }
 
   // Filter frontiers: find the best one
@@ -1511,8 +1765,8 @@ void Explore::makePlan()
     // 4. Generate viewpoint; skip this frontier if no cell near it actually
     //    clears the footprint's inflation buffer (too tight to approach safely
     //    right now), rather than sending a goal Nav2 can never settle into.
-    bool safe_viewpoint_found = false;
-    best_target = findSafeViewpoint(f.middle, safe_viewpoint_found);
+    bool safe_viewpoint_found = f.fixed_goal;
+    best_target = f.fixed_goal ? f.middle : findSafeViewpoint(f.middle, safe_viewpoint_found);
     if (!safe_viewpoint_found) {
       n_no_viewpoint++;
       frontier_it++;
@@ -1541,6 +1795,10 @@ void Explore::makePlan()
 
   // Handle no valid frontiers
   if (!found_target) {
+    if (invalid_goal_pending_cancel_) {
+      move_base_client_->async_cancel_goal(navigation_goal_handle_);
+      invalid_goal_pending_cancel_ = false;
+    }
     // "Every remaining frontier is gated" (all infinite-cost: dose- or
     // battery-infeasible) is a different map state from "no frontiers
     // remain". The GP heatmap keeps refining as samples arrive, so a
@@ -1626,12 +1884,12 @@ void Explore::makePlan()
 
   // If we get here, no goal is active (or it was just invalidated).
   // Check the queue first for zero-delay transition, otherwise use the best target found.
-  if (has_queued_target_ && !goalOnBlacklist(queued_target_)) {
-    sendGoal(queued_target_);
-    has_queued_target_ = false;
-  } else {
-    sendGoal(best_target);
-  }
+  // best_target was computed this tick; a queued target is older and was
+  // observed sending a stale spatial frontier (9.20, 0.08) in place of the
+  // ring point just selected (2026-10-29).
+  has_queued_target_ = false;
+  invalid_goal_pending_cancel_ = false;
+  sendGoal(best_target);
 }
 
 void Explore::sendGoal(const geometry_msgs::msg::Point & target, bool is_recalibration)
@@ -1873,7 +2131,10 @@ void Explore::feedbackCallback(
     // tick) cancel this goal and retreat to nearby safe space, instead of
     // leaving explore_lite free to blacklist/replace this goal out from under
     // whatever Nav2 is doing to get unstuck. Skip if we're already mid-retreat.
-    if (!recalibrating_) {
+    // Not during a zone episode: the retreat deliberately leaves the source we
+    // are heading for, and its "safe" cell sat against a barrier where the
+    // robot hard-wedged for 170 s (auto2, 2026-10-29).
+    if (!recalibrating_ && !zone_target_active_ && !zone_ring_active_) {
       recalibration_requested_ = true;
     }
   }
@@ -2034,6 +2295,14 @@ bool Explore::resetServiceCallback(
   exploration_mode_              = ExplorationMode::SPATIAL;
   radiation_in_boundary_phase_   = false;
   radiation_mode_above_count_    = 0;
+  zone_target_active_            = false;
+  zone_ring_active_              = false;
+  zone_wp_latched_               = false;
+  sweep_wp_latched_              = false;
+  sweep_announced_               = false;
+  rad_trail_.clear();
+  zone_ring_.clear();
+  localized_zones_.clear();
   recent_rad_buffer_.clear();
   rad_bg_buffer_.clear();
   rad_bg_mean_ = 0.0;

@@ -63,6 +63,7 @@
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <ros2_rad_map/msg/rad_zone_array.hpp>
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
 
@@ -157,6 +158,46 @@ private:
     void heatmapStdCallback(const sensor_msgs::msg::Image::SharedPtr msg);
 
     rclcpp::Subscription < geometry_msgs::msg::PointStamped > ::SharedPtr stable_source_sub_;
+    // Candidate source zones from peak_finder_client_node (/radiation_zones).
+    // A new, not-yet-localized zone forces RADIATION mode and becomes the
+    // drive-to target (see radZonesCallback / generateRadiationFrontiers).
+    rclcpp::Subscription < ros2_rad_map::msg::RadZoneArray > ::SharedPtr rad_zones_sub_;
+    void radZonesCallback(const ros2_rad_map::msg::RadZoneArray::SharedPtr msg);
+    bool zone_target_active_ = false;
+    geometry_msgs::msg::Point zone_target_;
+    std::vector<geometry_msgs::msg::Point> localized_zones_;
+    double zone_arrival_radius_m_ = 1.5;   // "at the source" -> start the ring sweep
+    double zone_revisit_radius_m_ = 1.5;   // ignore candidates this close to a localized one
+    // Ring sweep around the zone estimate once reached: waypoints on a circle,
+    // visited in turn, independent of the heatmap (the heatmap boundary survey
+    // needs cells >= safe_dose_threshold around the robot, which a weak or
+    // freshly-estimated source never provides, so it ended instantly).
+    bool zone_ring_active_ = false;
+    geometry_msgs::msg::Point zone_ring_center_;
+    std::vector<geometry_msgs::msg::Point> zone_ring_;
+    double zone_ring_radius_m_ = 2.0;
+    int    zone_ring_points_   = 6;
+    double zone_ring_visit_m_  = 0.8;
+    void finishZoneEpisode(const char * why);
+    // Radiation coverage sweep. Lidar maps a room from its doorway, so a
+    // source in already-mapped free space never raises a frontier and the
+    // detector never gets within range of it (the spawn room, 2026-10-29).
+    // Once spatial frontiers are exhausted, visit free cells on a grid that
+    // the robot has not passed within rad_sweep_radius_m_ of.
+    std::vector<geometry_msgs::msg::Point> rad_trail_;   // robot positions, ~0.5 m apart
+    double rad_sweep_spacing_m_ = 2.5;
+    double rad_sweep_radius_m_  = 2.0;
+    bool sweep_wp_latched_ = false;
+    bool invalid_goal_pending_cancel_ = false;
+    geometry_msgs::msg::Point sweep_wp_;
+    bool sweep_announced_ = false;
+    std::vector<frontier_exploration::Frontier> generateCoverageSweepFrontiers(
+      const geometry_msgs::msg::Point & robot);
+    // The waypoint currently being driven to in a zone episode. Latched until
+    // reached or blacklisted: recomputing the viewpoint / nearest ring point on
+    // every planning tick re-targeted Nav2 several times a second (2026-10-29).
+    bool zone_wp_latched_ = false;
+    geometry_msgs::msg::Point zone_wp_;
     void stableSourceCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
 
     // stuck_escape_node publishes here once its own backup+Spin recovery

@@ -16,6 +16,7 @@
   <test_depend>ament_lint_common</test_depend>
   <depend>ament_cmake</depend>
   <depend>cv_bridge</depend>
+  <depend>ros2_rad_map</depend>
   <depend>geometry_msgs</depend>
   <depend>map_msgs</depend>
   <depend>nav2_costmap_2d</depend>

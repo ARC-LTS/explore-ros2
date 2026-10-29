@@ -25,6 +25,7 @@ namespace frontier_exploration
     double path_heading_y = 0.0;
     std::vector < geometry_msgs::msg::Point > points;
     bool is_radiation = false;    // true = radiation frontier (gradient-based), false = spatial
+    bool fixed_goal = false;      // zone/ring/sweep waypoint: send `middle` as-is, no viewpoint search
   };
 
 /**

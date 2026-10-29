@@ -42,4 +42,15 @@
     heatmap_topic: /rad_heatmap/raw_mean_map
     radiation_scale: 1.0
     radiation_gradient_scale: 1.0
+    # Engage RADIATION mode (gradient ascent toward the source, then the
+    # boundary survey) on the first elevated reading instead of waiting for
+    # five consecutive ones -- the robot used to drive past a source before
+    # the entry hysteresis cleared (2026-10-29). Exit hysteresis stays at the
+    # default so one low reading does not drop it back to spatial exploration.
+    # 2026-10-29 (later): reading-triggered entry effectively disabled. Its
+    # gradient-ascent phase re-targets Nav2 every planner tick (new 3 m/6 m
+    # candidate from the heatmap gradient at the robot's current cell), which
+    # thrashed the global planner. Source localization is driven by the
+    # peak-finder zone episodes in explore_node instead (latched waypoints).
+    radiation_mode_entry_hysteresis: 1000000
     min_goal_distance_for_replanning: 0.75

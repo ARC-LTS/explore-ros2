@@ -354,6 +354,23 @@ Frontier FrontierSearch::buildNewFrontier(
   if (output.size > 0) { // Avoid division by zero
     output.centroid.x /= output.size;
     output.centroid.y /= output.size;
+    // Goal point: the frontier cell nearest the centroid, i.e. mid-span. The
+    // BFS above left `middle` at the cell with the shortest path to the robot,
+    // which is by construction the frontier's end nearest the robot -- where
+    // the frontier meets a wall -- so the viewpoint hugged the inflation band
+    // and the robot wedged there (2026-10-29). min_distance/path_heading still
+    // come from the nearest cell; only the target point moves.
+    double best_d2 = std::numeric_limits<double>::infinity();
+    for (const auto & pt : output.points) {
+      double ddx = pt.x - output.centroid.x;
+      double ddy = pt.y - output.centroid.y;
+      double d2 = ddx * ddx + ddy * ddy;
+      if (d2 < best_d2) {
+        best_d2 = d2;
+        output.middle.x = pt.x;
+        output.middle.y = pt.y;
+      }
+    }
   } else {
     RCLCPP_WARN(logger_, "[FrontierSearch] Frontier with size 0 created. Centroid will be (0,0).");
     // If a frontier is size 0, it shouldn't be added to the list in searchFrom anyway
